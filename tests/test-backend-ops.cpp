@@ -9438,6 +9438,15 @@ struct test_flash_attn_ext_banded_large_rel : public test_flash_attn_ext_banded_
     }
 };
 
+// small extent and a tight tolerance, so that per-query sinks and the band edges are visible
+struct test_flash_attn_ext_banded_tight : public test_flash_attn_ext_banded_sinks {
+    using test_flash_attn_ext_banded_sinks::test_flash_attn_ext_banded_sinks;
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -13708,6 +13717,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext_banded_large_rel(128, 24, 8, 512, 9000, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32, 2));
+    for (int64_t n_q : { 33, 100 }) {
+        for (int64_t n_kv : { 300, 1000 }) {
+            for (int mask_kind : { 1, 2 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_banded_tight(128, 24, 8, n_q, n_kv, 96, mask_kind, GGML_TYPE_F16, GGML_TYPE_F32, 2));
+            }
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 1, 4096, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512,  8192, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 16384, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
