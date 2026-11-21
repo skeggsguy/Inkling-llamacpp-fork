@@ -132,6 +132,14 @@ class TensorNameMap:
             "model.attn_res.output_query",  # inkling2
         ),
 
+        MODEL_TENSOR.LOOP_RES_QUERY: (
+            "model.middle_cycle_cross_pass_queries",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_KV_RES_QUERY: (
+            "model.middle_cycle_cross_pass_kv_queries",  # inkling2 loop
+        ),
+
         # Rope frequencies
         MODEL_TENSOR.ROPE_FREQS: (
             "rope.freqs",  # llama-pth
@@ -273,6 +281,7 @@ class TensorNameMap:
             "model.layers.{bid}.pre_attention_layernorm",           # kormo
             "head.layers.{bid}.norm1",  # laya
             "model.layers.{bid}.attn_norm",                         # inkling2
+            "model.layers.{bid}.pre_attention_norm",                # domynedge
         ),
 
         # Attention norm 2
@@ -441,6 +450,7 @@ class TensorNameMap:
             "model.layers.{bid}.post_attn_norm",                 # kolibri1
             "model.layers.layers.{bid}.post_mixer_norm.weight",  # plamo2
             "model.layers.{bid}.post_operator_norm",             # lfm3
+            "model.layers.{bid}.post_attention_norm",            # domynedge
         ),
 
         # Rotary embeddings
@@ -542,6 +552,18 @@ class TensorNameMap:
             "model.layers.{bid}.attention_input.query",  # inkling2
         ),
 
+        MODEL_TENSOR.ATTN_K_CTX: (
+            "layers.{bid}.self_attn.k_proj_ctx",  # inkling2 dspark
+        ),
+
+        MODEL_TENSOR.ATTN_V_CTX: (
+            "layers.{bid}.self_attn.v_proj_ctx",  # inkling2 dspark
+        ),
+
+        MODEL_TENSOR.ATTN_K_CTX_NORM: (
+            "layers.{bid}.self_attn.k_norm_ctx",  # inkling2 dspark
+        ),
+
         # Feed-forward norm
         MODEL_TENSOR.FFN_NORM: (
             "layers.{bid}.moe_connection.norm",                              # metis16
@@ -580,6 +602,7 @@ class TensorNameMap:
             "layers.{bid}.pre_feedforward_layernorm",       # embeddinggemma
             "model.layers.{bid}.pre_ff_layernorm.weight",
             "model.layers.{bid}.pre_mlp_layernorm",        # afmoe
+            "model.layers.{bid}.pre_feedforward_norm",     # domynedge
         ),
 
         MODEL_TENSOR.FFN_PRE_NORM_2: (
@@ -604,6 +627,7 @@ class TensorNameMap:
             "model.layers.{bid}.feed_forward.up_proj",
             "model.layers.{bid}.post_moe_norm",               # grok-2
             "model.layers.{bid}.post_ffn_norm",               # lfm3
+            "model.layers.{bid}.post_feedforward_norm",       # domynedge
         ),
 
         MODEL_TENSOR.FFN_POST_NORM_1: (
@@ -693,6 +717,7 @@ class TensorNameMap:
             "encoder.layers.{bid}.mlp.dense_h_to_4h",                 # chatglm
             "transformer.h.{bid}.mlp.c_fc_1",                         # exaone
             "model.layers.{bid}.feed_forward.up_proj",                # llama4 jamba granite-hybrid
+            "model.layers.{bid}.feedforward.up_proj",                 # domynedge
             "transformer_encoder.{bid}.ffn.w12",                      # neobert
             "model.layers.{bid}.block_sparse_moe.up",                 # smallthinker
             "model.transformer.blocks.{bid}.up_proj",                 # llada
@@ -756,6 +781,7 @@ class TensorNameMap:
             "layers.{bid}.mlp.gate_proj",                     # qwen3-embedding
             "model.layers.{bid}.mlp.language_mlp.gate_proj",  # cogvlm
             "model.blocks.{bid}.mlp.mlp_gate",                # talkie
+            "model.layers.{bid}.feedforward.gate_proj",       # domynedge
         ),
 
         MODEL_TENSOR.FFN_GATE_EXP: (
@@ -810,6 +836,54 @@ class TensorNameMap:
         MODEL_TENSOR.FFN_RES_QUERY: (
             "model.layers.{bid}.mlp_input.query",  # inkling2
             "model.attn_res.mlp_queries.{bid}",    # inkling2
+        ),
+
+        MODEL_TENSOR.LOOP_ATTN_DOWN: (
+            "model.layers.{bid}.controllers.attn.down_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_ATTN_GAIN: (
+            "model.layers.{bid}.controllers.attn.gain_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_ATTN_FORGET: (
+            "model.layers.{bid}.controllers.attn.forget_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_K_DOWN: (
+            "model.layers.{bid}.controllers.k.down_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_K_GAIN: (
+            "model.layers.{bid}.controllers.k.gain_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_K_FORGET: (
+            "model.layers.{bid}.controllers.k.forget_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_V_DOWN: (
+            "model.layers.{bid}.controllers.v.down_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_V_GAIN: (
+            "model.layers.{bid}.controllers.v.gain_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_V_FORGET: (
+            "model.layers.{bid}.controllers.v.forget_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_MLP_DOWN: (
+            "model.layers.{bid}.controllers.mlp.down_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_MLP_GAIN: (
+            "model.layers.{bid}.controllers.mlp.gain_weight",  # inkling2 loop
+        ),
+
+        MODEL_TENSOR.LOOP_MLP_FORGET: (
+            "model.layers.{bid}.controllers.mlp.forget_weight",  # inkling2 loop
         ),
 
         MODEL_TENSOR.STREAM_EMBD: (
@@ -924,6 +998,7 @@ class TensorNameMap:
             "encoder.layers.{bid}.mlp.dense_4h_to_h",                 # chatglm
             "model.layers.h.{bid}.mlp.c_proj",                        # exaone
             "model.layers.{bid}.feed_forward.down_proj",              # llama4 jamba granite-hybrid
+            "model.layers.{bid}.feedforward.down_proj",               # domynedge
             "transformer_encoder.{bid}.ffn.w3",                       # neobert
             "model.layers.{bid}.block_sparse_moe.down",               # smallthinker
             "model.transformer.blocks.{bid}.ff_out",                  # llada
@@ -998,6 +1073,7 @@ class TensorNameMap:
             "layers.{bid}.self_attn.k_norm",                                  # qwen3-embedding
             "model.layers.{bid}.self_attn.k_rope_only_layernorm",             # dots3note
             "model.layers.{bid}.attention.key_layernorm",                     # apertus
+            "model.layers.{bid}.attention.k_norm",                            # domynedge
         ),
 
         MODEL_TENSOR.ROPE_FREQS: (
@@ -1783,6 +1859,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.DSPARK_MARKOV_W1: (
             "model.markov_head.markov_w1", # dspark
+            "markov_head.markov_w1",       # inkling2
         ),
 
         MODEL_TENSOR.DSPARK_MARKOV_W2: (
@@ -1791,6 +1868,30 @@ class TensorNameMap:
 
         MODEL_TENSOR.DSPARK_CONF_PROJ: (
             "model.confidence_head.proj", # dspark
+        ),
+
+        MODEL_TENSOR.DSPARK_JOINT_PROJ: (
+            "markov_head.rnn_proj", # inkling2
+        ),
+
+        MODEL_TENSOR.DSPARK_MASK_EMBD: (
+            "mask_embed", # inkling2
+        ),
+
+        MODEL_TENSOR.DSPARK_FUSE: (
+            "fuse_weight", # inkling2
+        ),
+
+        MODEL_TENSOR.DSPARK_NORM: (
+            "markov_head.dflare_norm", # inkling2
+        ),
+
+        MODEL_TENSOR.DSPARK_HIDDEN_OUT: (
+            "markov_head.hidden_out", # inkling2
+        ),
+
+        MODEL_TENSOR.DFLARE_NORM: (
+            "layers.{bid}.dflare_norm", # inkling2
         ),
 
         MODEL_TENSOR.DFLASH_ATTN_CONV_BASE: (

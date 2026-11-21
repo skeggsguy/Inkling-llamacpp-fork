@@ -247,7 +247,7 @@ struct kv_writer {
     }
 };
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0, const bool loop = false) {
     gguf_context_ptr ret(gguf_init_empty());
     kv_writer ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -330,7 +330,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_embd  = 128;
         n_head  = 4;
         n_ff    = 24;
-        n_layer = 3;
+        n_layer = loop ? 16 : 3; // loop: 8 layers, the core [2, 6) runs 3 passes
     }
 
     uint32_t n_head_kv = n_head;
@@ -496,15 +496,21 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
     } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_SPARK2_5 ||
             arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_MUSE_SPARK || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE ||
-            arch == LLM_ARCH_KOLIBRI1 || arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_FLINT || arch == LLM_ARCH_BEAM || arch == LLM_ARCH_RICURSIVE) {
+            arch == LLM_ARCH_KOLIBRI1 || arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_FLINT || arch == LLM_ARCH_BEAM || arch == LLM_ARCH_RICURSIVE || arch == LLM_ARCH_DOMYN_EDGE) {
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
             pattern.push_back(il % 2);
         }
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
-        if (arch == LLM_ARCH_FLINT) {
+        if (arch == LLM_ARCH_FLINT || arch == LLM_ARCH_DOMYN_EDGE) {
             ms.add_kv(LLM_KV_ATTENTION_ROPE_PATTERN, pattern);
+        }
+        if (arch == LLM_ARCH_DOMYN_EDGE) {
+            // SWA (rope) layers use a smaller head dim than the full-attention (nope) layers
+            ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,   n_embd_head/2);
+            ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA, n_embd_head/2);
+            ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT_SWA, n_embd_head/2);
         }
     } else if (arch == LLM_ARCH_LFM3) {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, std::vector<uint32_t>({0, 0, 1}));
@@ -716,7 +722,14 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,           uint32_t(2));
         std::vector<bool> pattern(n_layer);
         for (uint32_t i = 0; i < n_layer; ++i) {
-            pattern[i] = i % 2 == 0;
+            const uint32_t ip = loop ? (i < 2 ? i : i < 14 ? 2 + (i - 2) % 4 : i - 8) : i;
+            pattern[i] = ip % 2 == 0;
+        }
+        if (loop) {
+            ms.add_kv(LLM_KV_NUM_LOOPS,       uint32_t(3));
+            ms.add_kv(LLM_KV_LOOP_CORE_START, uint32_t(2));
+            ms.add_kv(LLM_KV_LOOP_CORE_END,   uint32_t(6));
+            ms.add_kv(LLM_KV_LOOP_GATE_RANK,  uint32_t(8));
         }
         std::vector<uint8_t> values(pattern.begin(), pattern.end());
         gguf_set_arr_data(ret.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN).c_str(), GGUF_TYPE_BOOL, values.data(), values.size());
@@ -831,10 +844,32 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_INKLING_UNPADDED_VOCAB_SIZE, n_vocab);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,        1.0f);
     }
+    if (arch == LLM_ARCH_DIFFUSION_GEMMA) {
+        // ISWA: the loader reads the SWA head lengths unconditionally, and they
+        // are separate keys from the non-SWA pair above.
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,   n_embd/n_head);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA, n_embd/n_head);
+        // canvas_length splits the forward at P = n_tokens - canvas_length and
+        // the loader rejects anything <= 0. Kept well under the 128 tokens the
+        // backend comparison decodes, so both halves of that split are exercised.
+        ms.add_kv(LLM_KV_DIFFUSION_CANVAS_LENGTH, uint32_t(16));
+        // diffusion-gemma needs a mix: with every layer sliding, the non-SWA mask
+        // is built and used by nothing, so ggml-alloc never gives it a buffer and
+        // set_input dereferences a null one. A real model has both kinds of layer.
+        std::vector<uint32_t> pattern;
+        pattern.reserve(n_layer);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            pattern.push_back(il % 2);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
+    }
     ms.add_kv(LLM_KV_WKV_HEAD_SIZE,               n_embd/n_head);
     ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(3));
     ms.add_kv(LLM_KV_RESIDUAL_SCALE,              3.5565588200778455f);
     ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(12));
+    if (loop) {
+        ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,     uint32_t(2));
+    }
     ms.add_kv(LLM_KV_ACTIVATION_SITU_BETA,        4.0f);
     ms.add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, 25.0f);
     ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,        -5.0f);
@@ -1110,6 +1145,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DOTS3NOTE:
+        case LLM_ARCH_DIFFUSION_GEMMA:
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_XING4_0:
@@ -1269,16 +1305,18 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
             if (moe && !moe_implemented(arch)) {
                 continue;
             }
-            if (!moe && moe_mandatory(arch)) {
+            // Inkling 2 has no dense model, its dense slot runs the looped MoE model
+            const bool loop = !moe && arch == LLM_ARCH_INKLING2;
+            if (!moe && !loop && moe_mandatory(arch)) {
                 continue;
             }
             if (!llama_arch_supports_save(arch) || !arch_supported(arch)) {
                 LOG_INF("%s: %s model (%s) is unsupported, skipping\n", __func__, llama_arch_name(arch), moe ? "MoE" : "dense");
                 continue;
             }
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe || loop, 0, loop);
             llama_model_ptr model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
-            const std::string path = dir + "/" + llama_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
+            const std::string path = dir + "/" + llama_arch_name(arch) + (loop ? "-moe-loop.gguf" : moe ? "-moe.gguf" : "-dense.gguf");
             LOG_INF("%s: '%s %s' -> %s ...", __func__, llama_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
             llama_model_save_to_file(model.get(), path.c_str());
             const std::uintmax_t size = std::filesystem::file_size(path);
@@ -1423,16 +1461,21 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             continue;
         }
 
-        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
+        // diffusion-gemma belongs here for the same reason as the other diffusion
+        // decoders: it sets causal_attn = false, so the whole batch is one
+        // encoder pass and n_ubatch must not be capped below n_tokens.
+        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1 || arch == LLM_ARCH_DIFFUSION_GEMMA;
         for (bool moe : {false, true}) {
             if (moe && !moe_implemented(arch)) {
                 continue;
             }
-            if (!moe && moe_mandatory(arch)) {
+            // Inkling 2 has no dense model, its dense slot runs the looped MoE model
+            const bool loop = !moe && arch == LLM_ARCH_INKLING2;
+            if (!moe && !loop && moe_mandatory(arch)) {
                 continue;
             }
-            const std::string config_name = moe ? "MoE" : "Dense";
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+            const std::string config_name = loop ? "Loop" : moe ? "MoE" : "Dense";
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe || loop, 0, loop);
             if (arch == LLM_ARCH_BAILINGMOE3) {
                 GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
             }

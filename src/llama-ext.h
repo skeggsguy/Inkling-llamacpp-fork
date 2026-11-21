@@ -114,6 +114,9 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
+// smallest MoE cache size that caches every layer with all of its experts in host memory, 0 if no layer would be cached
+LLAMA_API size_t llama_model_moe_cache_min_size(const struct llama_model * model);
+
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
 LLAMA_API std::vector<ggml_tensor *> llama_memory_get_tensors(const llama_memory_t mem);
@@ -146,6 +149,10 @@ LLAMA_API bool llama_batch_ext_set_decision_group(struct llama_batch_ext * batch
 // Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
 LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
 
+// Run a pending scheduler reserve now instead of on the next decode, e.g. so that the memory breakdown of an
+// allocation-free context reflects flags that change the graph shape
+LLAMA_API void llama_sched_reserve(struct llama_context * ctx);
+
 //
 // model/context data extraction
 //
@@ -165,3 +172,10 @@ LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
 
 // each sequence is paired with an unconditional one at n_seq_max / 2 + seq_id, in a unified KV cache
 LLAMA_API bool llama_model_classifier_free_guidance(const struct llama_model * model);
+
+// Inkling2 DSpark: decode the block backbone once, exposing base logits and hidden rows through the usual getters.
+LLAMA_API int32_t llama_draft_backbone(struct llama_context * ctx, const struct llama_batch_ext * batch);
+
+// Evaluate one recurrent head step without touching KV. Inputs and rank state are host F32 buffers.
+LLAMA_API bool llama_draft_step(struct llama_context * ctx, llama_token token, llama_embd hidden, llama_embd base,
+        llama_embd context, std::vector<float> & state, std::vector<float> & logits);

@@ -1438,6 +1438,7 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_KIMIVL:
         case PROJECTOR_TYPE_KIMIK25:
+        case PROJECTOR_TYPE_KIMIK3:
         case PROJECTOR_TYPE_KIMIK31:
         case PROJECTOR_TYPE_LIGHTONOCR:
             {

@@ -68,6 +68,7 @@ enum llm_arch {
     LLM_ARCH_GEMMA3N,
     LLM_ARCH_GEMMA4,
     LLM_ARCH_GEMMA4_ASSISTANT,
+    LLM_ARCH_DIFFUSION_GEMMA,
     LLM_ARCH_GEMMA_EMBEDDING,
     LLM_ARCH_GEMMA_EMBEDDING2,
     LLM_ARCH_STARCODER2,
@@ -189,6 +190,7 @@ enum llm_arch {
     LLM_ARCH_LIMITE,
     LLM_ARCH_RICURSIVE,
     LLM_ARCH_INKLING2,
+    LLM_ARCH_DOMYN_EDGE,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -285,6 +287,9 @@ enum llm_kv {
     LLM_KV_FULL_ATTENTION_INTERVAL,
     LLM_KV_NUM_LOOPS,
     LLM_KV_SKIP_LOOP_FINAL_NORM,
+    LLM_KV_LOOP_CORE_START,
+    LLM_KV_LOOP_CORE_END,
+    LLM_KV_LOOP_GATE_RANK,
     LLM_KV_HRM_LAYERS_PER_STACK,
     LLM_KV_HRM_H_CYCLES,
     LLM_KV_HRM_L_CYCLES,
@@ -491,6 +496,7 @@ enum llm_kv {
     LLM_KV_DFLASH_CONV_GROUP_SIZE,
     LLM_KV_DFLASH_SELECTOR_RANK,
     LLM_KV_DFLASH_SELECTOR_TOP_K,
+    LLM_KV_DSPARK_MARKOV_RANK,
     LLM_KV_LILICORR_HIDDEN_SIZE,
     LLM_KV_LILICORR_CANDIDATE_TOPK,
     LLM_KV_LILICORR_NUM_HEADS,
@@ -514,6 +520,8 @@ enum llm_kv {
     LLM_KV_INKLING_LOG_SCALING_N_FLOOR,
     LLM_KV_INKLING_LOG_SCALING_ALPHA,
     LLM_KV_INKLING_UNPADDED_VOCAB_SIZE,
+
+    LLM_KV_DIFFUSION_CANVAS_LENGTH,
 
     LLM_KV_XIELU_ALPHA_N,
     LLM_KV_XIELU_ALPHA_P,
@@ -556,6 +564,8 @@ enum llm_tensor {
     LLM_TENSOR_OUTPUT_NORM,
     LLM_TENSOR_OUTPUT_NORM_LFM2, // fix for wrong tensor name
     LLM_TENSOR_OUTPUT_RES_QUERY,
+    LLM_TENSOR_LOOP_RES_QUERY,
+    LLM_TENSOR_LOOP_KV_RES_QUERY,
     LLM_TENSOR_ROPE_FREQS,
     LLM_TENSOR_ROPE_FACTORS_LONG,
     LLM_TENSOR_ROPE_FACTORS_SHORT,
@@ -588,6 +598,9 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_V_CONV_PROJ,
     LLM_TENSOR_ATTN_POST_CONV,
     LLM_TENSOR_ATTN_RES_QUERY,
+    LLM_TENSOR_ATTN_K_CTX,
+    LLM_TENSOR_ATTN_V_CTX,
+    LLM_TENSOR_ATTN_K_CTX_NORM,
     LLM_TENSOR_FFN_GATE_INP,
     LLM_TENSOR_FFN_GATE_INP_SHEXP,
     LLM_TENSOR_FFN_NORM,
@@ -625,6 +638,18 @@ enum llm_tensor {
     LLM_TENSOR_FFN_LATENT_UP,
     LLM_TENSOR_FFN_POST_CONV,
     LLM_TENSOR_FFN_RES_QUERY,
+    LLM_TENSOR_LOOP_ATTN_DOWN,
+    LLM_TENSOR_LOOP_ATTN_GAIN,
+    LLM_TENSOR_LOOP_ATTN_FORGET,
+    LLM_TENSOR_LOOP_K_DOWN,
+    LLM_TENSOR_LOOP_K_GAIN,
+    LLM_TENSOR_LOOP_K_FORGET,
+    LLM_TENSOR_LOOP_V_DOWN,
+    LLM_TENSOR_LOOP_V_GAIN,
+    LLM_TENSOR_LOOP_V_FORGET,
+    LLM_TENSOR_LOOP_MLP_DOWN,
+    LLM_TENSOR_LOOP_MLP_GAIN,
+    LLM_TENSOR_LOOP_MLP_FORGET,
     LLM_TENSOR_STREAM_EMBD,
     LLM_TENSOR_DEPTH_MEM_STATE_WRITE,
     LLM_TENSOR_DEPTH_MEM_META_WRITE,
@@ -663,6 +688,11 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_K_NORM,
     LLM_TENSOR_LAYER_OUT_NORM,
     LLM_TENSOR_LAYER_OUT_SCALE,
+    LLM_TENSOR_ENC_LAYER_OUT_SCALE, // diffusion-gemma (encoder-mode per-layer scalar)
+    LLM_TENSOR_SC_PRE_NORM,         // diffusion-gemma self-conditioning
+    LLM_TENSOR_SC_GATE,             // diffusion-gemma self-conditioning
+    LLM_TENSOR_SC_UP,               // diffusion-gemma self-conditioning
+    LLM_TENSOR_SC_DOWN,             // diffusion-gemma self-conditioning
     LLM_TENSOR_ATTN_VRES_LAMBDA,
     LLM_TENSOR_POST_ATTN_NORM,
     LLM_TENSOR_POST_MLP_NORM,
@@ -921,6 +951,10 @@ enum llm_tensor {
     LLM_TENSOR_DSPARK_CONF_PROJ,
     LLM_TENSOR_DSPARK_JOINT_PROJ,
     LLM_TENSOR_DSPARK_MASK_EMBD,
+    LLM_TENSOR_DSPARK_FUSE,
+    LLM_TENSOR_DSPARK_NORM,
+    LLM_TENSOR_DSPARK_HIDDEN_OUT,
+    LLM_TENSOR_DFLARE_NORM,
     LLM_TENSOR_ENGRAM_KV,
     LLM_TENSOR_ENGRAM_GATE,
     LLM_TENSOR_DFLASH_ATTN_CONV_BASE,
@@ -965,10 +999,11 @@ enum llm_tensor_layer {
 };
 
 struct LLM_KV {
-    LLM_KV(llm_arch arch, const char * suffix = nullptr);
+    LLM_KV(llm_arch arch, const char * suffix = nullptr, const char * prefix = nullptr);
 
     llm_arch arch;
     const char * suffix;
+    const char * prefix; // KV prefix as written in the file (differs from the arch name for legacy names)
 
     std::string operator()(llm_kv kv) const;
 };

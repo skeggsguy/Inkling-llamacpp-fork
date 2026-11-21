@@ -1029,6 +1029,15 @@ class GGUFWriter:
     def add_skip_loop_final_norm(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SKIP_LOOP_FINAL_NORM.format(arch=self.arch), value)
 
+    def add_loop_core_start(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.LOOP_CORE_START.format(arch=self.arch), value)
+
+    def add_loop_core_end(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.LOOP_CORE_END.format(arch=self.arch), value)
+
+    def add_loop_gate_rank(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.LOOP_GATE_RANK.format(arch=self.arch), value)
+
     def add_interleave_moe_layer_step(self, value: int) -> None:
         self.add_uint32(Keys.LLM.INTERLEAVE_MOE_LAYER_STEP.format(arch=self.arch), value)
 
@@ -1883,6 +1892,27 @@ class GGUFWriter:
 
     def add_diffusion_shift_logits(self, value: bool) -> None:
         self.add_bool(Keys.Diffusion.SHIFT_LOGITS, value)
+
+    def add_diffusion_canvas_length(self, value: int) -> None:
+        self.add_uint32(Keys.Diffusion.CANVAS_LENGTH, value)
+
+    def add_diffusion_eb_max_steps(self, value: int) -> None:
+        self.add_uint32(Keys.Diffusion.EB_MAX_STEPS, value)
+
+    def add_diffusion_eb_t_min(self, value: float) -> None:
+        self.add_float32(Keys.Diffusion.EB_T_MIN, value)
+
+    def add_diffusion_eb_t_max(self, value: float) -> None:
+        self.add_float32(Keys.Diffusion.EB_T_MAX, value)
+
+    def add_diffusion_eb_entropy_bound(self, value: float) -> None:
+        self.add_float32(Keys.Diffusion.EB_ENTROPY_BOUND, value)
+
+    def add_diffusion_eb_stability_threshold(self, value: int) -> None:
+        self.add_uint32(Keys.Diffusion.EB_STABILITY, value)
+
+    def add_diffusion_eb_confidence_threshold(self, value: float) -> None:
+        self.add_float32(Keys.Diffusion.EB_CONFIDENCE, value)
 
     def _pack(self, fmt: str, value: Any, skip_pack_prefix: bool = False) -> bytes:
         pack_prefix = ''

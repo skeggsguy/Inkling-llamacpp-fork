@@ -254,6 +254,18 @@ llama_context::llama_context(
         }
     }
 
+    // not via ctx_other: for draft-mtp that means the draft shares the target's memory
+    cparams.model_tgt = nullptr;
+    // a vocab-only model has no tensors at all
+    if (!hparams.vocab_only && model.arch == LLM_ARCH_QWEN4EXP && (model.tok_embd == nullptr || model.output == nullptr)) {
+        const llama_model * tgt = params.ctx_other ? llama_get_model(params.ctx_other) : nullptr;
+        if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || !tgt || !tgt->tok_embd || !tgt->output ||
+            tgt->hparams.n_embd != model.hparams.n_embd || tgt->vocab.n_tokens() != model.vocab.n_tokens()) {
+            throw std::runtime_error(model.arch_name() + " head without token_embd/output only works as an MTP draft (--spec-type draft-mtp) of a matching target (this warning is normal during memory fitting)");
+        }
+        cparams.model_tgt = tgt;
+    }
+
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         cparams.rope_scaling_type = hparams.rope_scaling_type_train;
     }
@@ -497,6 +509,23 @@ llama_context::llama_context(
             }
         }
 
+        // a draft head that borrows the target's token_embd/output reads them where the target placed them,
+        // so the target's devices need a backend here even when the draft runs on other devices
+        if (cparams.model_tgt) {
+            for (const auto & dev : cparams.model_tgt->devices) {
+                const bool have = std::any_of(backends.begin(), backends.end(),
+                        [&](const ggml_backend_ptr & b) { return ggml_backend_get_device(b.get()) == dev.dev; });
+                if (have) {
+                    continue;
+                }
+                ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+                if (backend == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
+                }
+                backends.emplace_back(backend);
+            }
+        }
+
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -588,7 +617,7 @@ llama_context::llama_context(
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
         bool pipeline_parallel =
             model.n_devices() > 1 &&
-            model.n_gpu_layers() > model.hparams.n_layer_all &&
+            model.n_gpu_layers() > model.hparams.n_layer_weights() &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides() &&
@@ -2155,7 +2184,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-int llama_context::decode(const llama_batch_ext & batch_inp) {
+int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtype) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2382,7 +2411,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const auto * res = process_ubatch(ubatch, gtype == LLM_GRAPH_TYPE_DEFAULT ? ctx_type_to_graph_type(cparams.ctx_type) : gtype, mctx.get(), status);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2626,6 +2655,45 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     //synchronize();
 
     return 0;
+}
+
+bool llama_context::draft_step(llama_token token, llama_embd hidden, llama_embd base, llama_embd context,
+        std::vector<float> & state, std::vector<float> & logits_out) {
+    const auto & hp = model.hparams;
+    const size_t width = hp.n_embd;
+    const size_t vocab = model.vocab.n_tokens();
+    const auto valid = [](llama_embd x, size_t n) { return x.data && x.n_rows == 1 && x.n_embd == n; };
+    if (!hp.dspark_markov_rank || !cparams.ctx_other || token < 0 || size_t(token) >= vocab ||
+            !valid(hidden, width) || !valid(base, vocab) || !valid(context, width) || state.size() != hp.dspark_markov_rank) {
+        return false;
+    }
+    synchronize();
+    std::vector<float> inputs(state);
+    inputs.insert(inputs.end(), hidden.data, hidden.data + width);
+    inputs.insert(inputs.end(), context.data, context.data + width);
+    inputs.insert(inputs.end(), base.data, base.data + vocab);
+
+    llama_batch_ext batch(this);
+    batch.mem = nullptr;
+    const int idx = batch.add_token(0);
+    const llama_pos pos = 0;
+    if (!batch.set_token_id(idx, token) || !batch.set_token_pos(idx, &pos) || !batch.set_output(idx, true) ||
+            !balloc->init(batch, model.vocab, true)) {
+        return false;
+    }
+    auto ubatch = balloc->split_simple(1);
+    ubatch.embd_state = inputs.data();
+    n_outputs = 1;
+    ggml_status status;
+    const auto * result = process_ubatch(ubatch, LLM_GRAPH_TYPE_DRAFT_HEAD, nullptr, status);
+    if (!result) {
+        return false;
+    }
+    synchronize();
+    logits_out.resize(vocab);
+    ggml_backend_tensor_get(result->get_logits(), logits_out.data(), 0, vocab * sizeof(float));
+    ggml_backend_tensor_get(result->get_h_nextn(), state.data(), 0, state.size() * sizeof(float));
+    return true;
 }
 
 //
@@ -2916,47 +2984,25 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes() const {
-    uint32_t res;
-    if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_KIMI_K31 || model.arch == LLM_ARCH_GLM5_NEXT ||
-        model.arch == LLM_ARCH_HRM_TEXT) {
-        res = std::max<uint32_t>(1024u, 64u * model.n_tensors());
-    } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
-        model.arch == LLM_ARCH_KIMI_LINEAR ||
-        model.arch == LLM_ARCH_METIS16 ||
-        model.arch == LLM_ARCH_BAILINGMOE3 ||
-        model.arch == LLM_ARCH_QWEN35 ||
-        model.arch == LLM_ARCH_QWEN35MOE ||
-        model.arch == LLM_ARCH_ZONOS3 ||
-        model.arch == LLM_ARCH_CLEF ||
-        model.arch == LLM_ARCH_CLOVER_MOE ||
-        model.arch == LLM_ARCH_QWEN4EXP ||
-        model.arch == LLM_ARCH_DEEPSEEK4 ||
-        model.arch == LLM_ARCH_DEEPSEEK41 ||
-        model.arch == LLM_ARCH_XING4_0 ||
-        (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
-        model.arch == LLM_ARCH_NANBEIGE ||
-        model.arch == LLM_ARCH_MINIMAX_01 ||
-        model.arch == LLM_ARCH_MINIMAX_M3 ||
-        model.arch == LLM_ARCH_HY_V4 ||
-        model.arch == LLM_ARCH_INKLING2) {
-        res = std::max<uint32_t>(1024u, 32u * model.n_tensors());
-    } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
-        // DFlash2's convolutions and selector are shape work rather than matmuls,
-        // so they cost ~8.6 nodes per tensor against ~5.9 for a plain DFlash draft.
-        // The selector lattice scales with the draft block size; 12u was calibrated
-        // on block-8 drafters, so scale the budget for larger blocks (e.g. Ripple's 16).
-        const uint32_t block_scale = std::max<uint32_t>(1u, model.hparams.dflash_block_size/8u);
-        res = std::max<uint32_t>(1024u, 12u*block_scale*model.n_tensors());
-    } else {
-        res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
-        for (const auto & lora : model.loras) {
-            res += lora->get_n_nodes();
-        }
+    uint32_t res = std::max<uint32_t>(1024u, model.graph_nodes_per_tensor()*model.n_tensors());
+    for (const auto & lora : model.loras) {
+        res += lora->get_n_nodes();
+    }
+
+    // the MoE cache adds a lookup to each MoE layer, and a second expert path with a CPU share (up to ~16 tensors per layer),
+    // which the per-tensor estimates above do not cover for models with few tensors per layer
+    if (cparams.moe_cache_size > 0) {
+        res += 32u*model.hparams.n_layer_all;
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
     for (const auto & [seq_id, sampler] : sampling.samplers) {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
+    }
+
+    // looped layers reuse their tensors once per pass
+    if (model.hparams.loop_n_pass > 1) {
+        res *= model.hparams.loop_n_pass;
     }
 
     if (cparams.training) {
@@ -3266,7 +3312,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
-        const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
+        const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_weights();
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
@@ -5206,4 +5252,20 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+void llama_sched_reserve(struct llama_context * ctx) {
+    ctx->sched_reserve();
+}
+
+int32_t llama_draft_backbone(llama_context * ctx, const llama_batch_ext * batch) {
+    if (!ctx || !batch || !llama_get_model(ctx)->hparams.dspark_markov_rank) {
+        return -1;
+    }
+    return ctx->decode(*batch, LLM_GRAPH_TYPE_DRAFT_BACKBONE);
+}
+
+bool llama_draft_step(llama_context * ctx, llama_token token, llama_embd hidden, llama_embd base,
+        llama_embd context, std::vector<float> & state, std::vector<float> & logits) {
+    return ctx && ctx->draft_step(token, hidden, base, context, state, logits);
 }
