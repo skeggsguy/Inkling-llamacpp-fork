@@ -334,6 +334,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         banded_dev_ok.push_back({ { swa, dev }, ok });
         return ok;
     };
+    // [base, swa] sliced masks of the banded layers
+    ggml_tensor * mask_banded[2] = { nullptr, nullptr };
     auto * recr = inp->get_recr();
 
     ggml_tensor * inp_pos     = build_inp_pos();
@@ -507,9 +509,13 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                     v_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], n_kv_b, v_all->ne[3],
                             v_all->nb[1], v_all->nb[2], v_all->nb[3], 0), 0, 2, 1, 3);
                 }
-                ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
-                ggml_tensor * m = ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
-                        mask->nb[1], mask->nb[2], mask->nb[3], 0));
+                // one sliced mask per cache: each view of the host mask is a separate device copy
+                ggml_tensor *& m = mask_banded[is_swa];
+                if (!m) {
+                    ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
+                    m = ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
+                            mask->nb[1], mask->nb[2], mask->nb[3], 0));
+                }
                 // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
                 ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
                 rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
