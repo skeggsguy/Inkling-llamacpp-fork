@@ -1904,8 +1904,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
         bool has_mask,
         bool has_sinks,
         bool has_bias,
-        bool has_scap) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+        bool has_scap,
+        bool has_kvpad,
+        bool has_rel,
+        int32_t rel_type) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
 
     char base[256];
     char name[256];
@@ -1916,7 +1919,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
     const char * type = op->src[1]->type == GGML_TYPE_BF16 ? "bf16" : "f16";
 
     snprintf(base, 256, "kernel_flash_attn_ext_tensor_%s_dk%d_dv%d", type, dk, dv);
-    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d", base, has_mask, has_sinks, has_bias, has_scap);
+    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_rel=%d_rt=%d", base, has_mask, has_sinks, has_bias, has_scap, has_kvpad, has_rel, rel_type);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1926,6 +1929,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
         ggml_metal_cv_set_bool(cv, has_sinks, FC_FLASH_ATTN_EXT_TENSOR + 1);
         ggml_metal_cv_set_bool(cv, has_bias,  FC_FLASH_ATTN_EXT_TENSOR + 2);
         ggml_metal_cv_set_bool(cv, has_scap,  FC_FLASH_ATTN_EXT_TENSOR + 3);
+        ggml_metal_cv_set_bool(cv, has_rel,   FC_FLASH_ATTN_EXT_TENSOR + 4);
+        ggml_metal_cv_set_bool(cv, has_kvpad, FC_FLASH_ATTN_EXT_TENSOR + 5);
+
+        ggml_metal_cv_set_int32(cv, rel_type, FC_FLASH_ATTN_EXT_TENSOR + 6);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

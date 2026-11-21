@@ -13719,11 +13719,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_banded_large_rel(128, 24, 8, 512, 9000, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32, 2));
     for (int64_t n_q : { 33, 100 }) {
         for (int64_t n_kv : { 300, 1000 }) {
-            for (int mask_kind : { 1, 2 }) {
+            for (int mask_kind : { 0, 1, 2 }) {
                 test_cases.emplace_back(new test_flash_attn_ext_banded_tight(128, 24, 8, n_q, n_kv, 96, mask_kind, GGML_TYPE_F16, GGML_TYPE_F32, 2));
             }
         }
     }
+    test_cases.emplace_back(new test_flash_attn_ext_banded_tight(128, 24, 8, 100, 1000, 96, 2, GGML_TYPE_F16,  GGML_TYPE_F16,  2));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 100, 1000, 96, 2, GGML_TYPE_BF16, GGML_TYPE_BF16, 2));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 1, 4096, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512,  8192, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 16384, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
