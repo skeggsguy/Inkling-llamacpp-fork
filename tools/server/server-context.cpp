@@ -1104,6 +1104,8 @@ private:
 
     server_batch batch;
 
+    uint32_t decode_prefill_tick = 0;
+
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
@@ -3947,12 +3949,28 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
-        // next, batch any pending prompts without exceeding n_batch
-        if (params_base.cont_batching || batch.size() == 0) {
+        // decode-priority chunked prefill: while any slot is generating, run 2 pure decode ticks
+        // per 128-token prefill chunk; when solo prefilling, use the full n_batch
+        const bool has_generating = batch.size() > 0;
+        bool allow_prompt = params_base.cont_batching || !has_generating;
+        int32_t n_batch_prompt = n_batch;
+        if (has_generating) {
+            ++decode_prefill_tick;
+            if (decode_prefill_tick % 3 != 0) {
+                allow_prompt = false;
+            } else {
+                n_batch_prompt = std::min<int32_t>(n_batch, batch.size() + 128);
+            }
+        } else {
+            decode_prefill_tick = 0;
+        }
+
+        // next, batch any pending prompts without exceeding n_batch_prompt
+        if (allow_prompt) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= n_batch_prompt) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -4408,8 +4426,10 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    const int32_t n_batch_slot = (slot.can_split() && n_decision_first < 0) ? n_batch_prompt : n_batch;
+
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_slot) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
