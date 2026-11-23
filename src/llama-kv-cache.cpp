@@ -3201,7 +3201,7 @@ uint32_t llama_kv_cache_context::get_size() const {
 llama_kv_banded_span llama_kv_cache_context::get_kv_banded_span() const {
     if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
         // reserve the banded path; the dense fallback is unallocatable at large n_ctx
-        if (kv != nullptr && lctx == nullptr && kv->get_n_stream() == 1) {
+        if (kv != nullptr && lctx == nullptr) {
             return { 0, (uint32_t) n_kv, 0, 0 };
         }
         return {};

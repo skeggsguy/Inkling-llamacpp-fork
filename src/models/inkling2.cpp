@@ -306,9 +306,10 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         const auto type_ok = [](ggml_type t) {
             return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || ggml_is_quantized(t);
         };
+        const int64_t n_stream_m = (swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
         if (!(inp->banded_span[swa].valid() && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
                 type_ok(cache->type_k()) && type_ok(cache->type_v()) && !cache->get_k_scale(il) && !cache->get_v_scale(il) &&
-                (swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3] == 1)) {
+                n_stream_m > 0 && n_tokens % n_stream_m == 0)) {
             return false;
         }
         ggml_backend_dev_t dev = model.dev_layer(il);
@@ -494,11 +495,12 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 ggml_build_forward_expand(gf, cache->cpy_v(ctx0, Vcur, is_swa ? attn->get_v_idxs_swa() : attn->get_v_idxs(), il));
 
                 const llama_kv_banded_span span = inp->banded_span[is_swa];
+                const int64_t n_q = n_tokens / n_stream;
                 ggml_tensor * k_all = cache->get_k(ctx0, il);
                 ggml_tensor * v_all = cache->get_v(ctx0, il);
                 GGML_ASSERT(span.c0 + span.n0 <= (uint32_t) k_all->ne[2]);
                 GGML_ASSERT(span.n1 == 0 || span.c1 + span.n1 <= (uint32_t) k_all->ne[2]);
-                ggml_tensor * q_fa = ggml_permute(ctx0, ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_tokens, 1), 0, 2, 1, 3);
+                ggml_tensor * q_fa = ggml_permute(ctx0, ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_q, n_stream), 0, 2, 1, 3);
                 auto slice_kv = [&](ggml_tensor * t, uint32_t c, uint32_t n) {
                     return ggml_view_4d(ctx0, t, t->ne[0], t->ne[1], n, t->ne[3],
                             t->nb[1], t->nb[2], t->nb[3], (size_t) c * t->nb[2]);
@@ -537,9 +539,9 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 }
                 // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
                 ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
-                rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
+                rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_q, n_stream);
                 cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
-                ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
+                ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_q, n_stream));
                 ggml_prec_set_acc(cur, GGML_PREC_F32);
                 res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
                 cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
