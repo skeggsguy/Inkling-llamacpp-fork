@@ -266,6 +266,9 @@ private:
     // (re)allocate the device buffer for cparams.embeddings_nextn_dev, false if it does not fit
     bool h_nextn_dev_alloc();
 
+    // precompute target.output @ dspark_hidden_out for Inkling2 DSpark
+    void dspark_w2_eff_init();
+
     ggml_backend_t backend_from_dev(ggml_backend_dev_t dev) const;
 
     //
@@ -487,6 +490,11 @@ private:
     ggml_backend_event_ptr  ev_h_nextn_read;
     bool ev_h_nextn_written_recorded = false;
     bool ev_h_nextn_read_recorded    = false;
+
+    // precomputed target.output[:n_vocab_unpadded] @ dspark_hidden_out, F16 [markov_rank, n_vocab_unpadded]
+    ggml_context_ptr        ctx_dspark_w2;
+    ggml_backend_buffer_ptr buf_dspark_w2;
+    ggml_tensor *           dspark_w2_eff = nullptr;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

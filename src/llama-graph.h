@@ -897,6 +897,7 @@ struct llm_graph_params {
     ggml_tensor * layer_inp_src = nullptr; // ctx_other's layer input device buffer (read)
     ggml_tensor * h_nextn_dev   = nullptr; // own h_nextn device buffer (write)
     ggml_tensor * h_nextn_src   = nullptr; // ctx_state_src's h_nextn device buffer (read)
+    ggml_tensor * dspark_w2_eff = nullptr; // precomputed target.output @ dspark_hidden_out
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -994,6 +995,7 @@ struct llm_graph_params {
             layer_inp_src == other.layer_inp_src &&
             h_nextn_dev   == other.h_nextn_dev   &&
             h_nextn_src   == other.h_nextn_src   &&
+            dspark_w2_eff == other.dspark_w2_eff &&
             model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1173,6 +1175,7 @@ struct llm_graph_context {
     ggml_tensor * layer_inp_src;
     ggml_tensor * h_nextn_dev;
     ggml_tensor * h_nextn_src;
+    ggml_tensor * dspark_w2_eff;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

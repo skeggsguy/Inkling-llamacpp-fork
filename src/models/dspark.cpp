@@ -944,7 +944,8 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
 }
 
 static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_model & model, const llama_model & target,
-        ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden, ggml_tensor * base, ggml_tensor * context) {
+        ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden, ggml_tensor * base, ggml_tensor * context,
+        ggml_tensor * w2_eff) {
     auto * ctx0 = g.ctx0;
     const int64_t rank = model.hparams.dspark_markov_rank;
     auto * joint = ggml_concat(ctx0, state, ggml_get_rows(ctx0, model.dspark_markov_w1, prev), 0);
@@ -957,8 +958,13 @@ static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_mode
     auto * candidate = ggml_tanh(ctx0, chunk(1));
     state = ggml_add(ctx0, candidate, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, candidate)));
     auto * latent = ggml_tanh(ctx0, chunk(2));
-    auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
-    auto * bias = g.build_lora_mm(target.output, correction, target.output_s);
+    ggml_tensor * bias;
+    if (w2_eff) {
+        bias = ggml_mul_mat(ctx0, w2_eff, latent);
+    } else {
+        auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
+        bias = g.build_lora_mm(target.output, correction, target.output_s);
+    }
     ggml_prec_set_acc(bias, GGML_PREC_F32);
     if (bias->ne[0] != base->ne[0]) {
         bias = ggml_cont(ctx0, ggml_view_2d(ctx0, bias, base->ne[0], bias->ne[1], bias->nb[1], 0));
@@ -984,7 +990,7 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         auto * hidden = rows(rank, n_embd);
         auto * context = rows(rank + n_embd, n_embd);
         auto * base = rows(rank + 2*n_embd, hparams.n_vocab_unpadded);
-        res->t_logits = build_inkling2_head(*this, model, *llama_get_model(cparams.ctx_other), inp->tokens, state, hidden, base, context);
+        res->t_logits = build_inkling2_head(*this, model, *llama_get_model(cparams.ctx_other), inp->tokens, state, hidden, base, context, dspark_w2_eff);
         res->t_embd = res->t_h_nextn = ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0);
         cb(res->t_h_nextn, "dspark_chain_state", -1);
         ggml_build_forward_expand(gf, res->t_h_nextn);
@@ -1086,11 +1092,19 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     }
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     res->t_embd = cur;
-    auto * base = build_lora_mm(target->output, cur, target->output_s);
+    ggml_tensor * out_w = target->output;
+    if (dspark_w2_eff && out_w->ne[1] != hparams.n_vocab_unpadded) {
+        out_w = ggml_view_2d(ctx0, out_w, n_embd, hparams.n_vocab_unpadded, out_w->nb[1], 0);
+    }
+    // Fold target.output @ dspark_hidden_out_b into base when using precomputed dspark_w2_eff.
+    ggml_tensor * base_inp = dspark_w2_eff ? ggml_add(ctx0, cur, model.dspark_hidden_out_b) : cur;
+    auto * base = build_lora_mm(out_w, base_inp, target->output_s);
     ggml_prec_set_acc(base, GGML_PREC_F32);
     if (params.gtype == LLM_GRAPH_TYPE_DRAFT_BACKBONE || block > hparams.dflash_block_size) {
         res->t_h_nextn = cur;
-        res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, base, hparams.n_vocab_unpadded, n_tokens, base->nb[1], 0));
+        res->t_logits = base->ne[0] == hparams.n_vocab_unpadded
+                ? base
+                : ggml_cont(ctx0, ggml_view_2d(ctx0, base, hparams.n_vocab_unpadded, n_tokens, base->nb[1], 0));
         return;
     }
     auto * state = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
@@ -1100,18 +1114,17 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, block*t->nb[1], i*t->nb[1]));
     };
     auto * context = column(f_rnn, 0);
-    auto * tie_rank = ggml_arange(ctx0, 0, hparams.n_vocab_unpadded, 1);
-    tie_rank = ggml_scale_bias(ctx0, tie_rank, -1.0f, hparams.n_vocab_unpadded);
     auto * prev = ids;
     for (int64_t i = 1; i < block; ++i) {
-        auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
+        auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context, dspark_w2_eff);
         states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
         logits = ggml_concat(ctx0, logits, col, 1);
-        // Select the first maximum, independent of backend argmax tie order.
-        auto * valid = ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
-        auto * maximum = ggml_pool_1d(ctx0, valid, GGML_OP_POOL_MAX, valid->ne[0], 1, 0);
-        auto * is_max = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_repeat(ctx0, maximum, valid), valid)), -1.0f, 1.0f);
-        prev = ggml_argmax(ctx0, ggml_mul(ctx0, is_max, tie_rank));
+        if (i + 1 < block) {
+            ggml_tensor * valid = col->ne[0] == hparams.n_vocab_unpadded
+                    ? col
+                    : ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
+            prev = ggml_argmax(ctx0, valid);
+        }
     }
     const auto block_order = [&](ggml_tensor * t) {
         t = ggml_reshape_3d(ctx0, t, t->ne[0], nb, block);
@@ -1121,5 +1134,7 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     cb(res->t_h_nextn, "dspark_chain_state", -1);
     ggml_build_forward_expand(gf, res->t_h_nextn);
     logits = block_order(logits);
-    res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, n_tokens, logits->nb[1], 0));
+    res->t_logits = logits->ne[0] == hparams.n_vocab_unpadded
+            ? logits
+            : ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, n_tokens, logits->nb[1], 0));
 }

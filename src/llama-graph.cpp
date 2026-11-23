@@ -1782,6 +1782,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     layer_inp_src    (params.layer_inp_src),
     h_nextn_dev      (params.h_nextn_dev),
     h_nextn_src      (params.h_nextn_src),
+    dspark_w2_eff    (params.dspark_w2_eff),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
