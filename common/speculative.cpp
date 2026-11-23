@@ -1227,6 +1227,7 @@ public:
                 continue;
             }
 
+            const llama_pos seq_pos_end = batch_in.tokens[i_batch_end[seq_id]].pos[0];
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
@@ -1245,6 +1246,10 @@ public:
                         LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                                 __func__, rc, (int) n_chunk, (int) offset);
                         return false;
+                    }
+                    // only sync/copy context features on chunks within the trailing block_size window
+                    if (seq_pos_end - batch_inject.tokens.back().pos[0] <= block_size) {
+                        store_context_features(seq_id, n_chunk);
                     }
                     continue;
                 }
@@ -1276,7 +1281,9 @@ public:
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
-                store_context_features(seq_id, n_chunk);
+                if (seq_pos_end - batch_inject.tokens.back().pos[0] <= block_size) {
+                    store_context_features(seq_id, n_chunk);
+                }
             }
         }
 
@@ -1435,22 +1442,34 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         LOG_INF("%s: - sample_from_anchor=%s, markov_rank=%d\n", __func__, sample_from_anchor ? "true" : "false", markov_rank);
 
         // anchor-first DSpark yields a full block_size draft tokens
-        // the recurrent head reads the context features back from h_nextn after a host copy injection
         init({
             /* .n_draft_max      = */ sample_from_anchor ? block_size : block_size - 1,
             /* .backend_sampling = */ !has_rnn_context,
-            /* .dev_features     = */ !has_rnn_context,
+            /* .dev_features     = */ true,
             /* .nextn_masked     = */ !has_rnn_context,
         });
 
         if (has_rnn_context) {
-            // Inkling2 uses host sampling to keep the first-maximum tie rule.
             for (auto & s : smpls) {
                 common_params_sampling sparams;
                 sparams.no_perf  = false;
                 sparams.temp     = 0.0f;
                 sparams.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
                 s.reset(common_sampler_init(model_dft, sparams));
+            }
+            // offload greedy argmax to the backend to avoid copying raw logits to host
+            if (this->params.backend_sampling && !this->params.probabilistic) {
+                auto * ctx_dft = this->params.ctx_dft;
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                    llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+                    if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
+                        SPC_WRN("backend greedy offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
+                        llama_sampler_free(chain);
+                        chain = nullptr;
+                    }
+                    backend_chains[seq_id] = chain;
+                }
             }
         }
     }
@@ -1546,6 +1565,7 @@ public:
             }
         }
 
+        std::vector<float> rnn_state, rnn_logits;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
@@ -1564,16 +1584,16 @@ public:
                     rnn_seed[seq_id] = dp.seed;
                     rnn_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
                 }
-                const float temp = dp.temp > 0.0f ? dp.temp : 1.0f;
+                const float inv_temp = 1.0f / (dp.temp > 0.0f ? dp.temp : 1.0f);
                 const size_t slot = size_t(seq_id)*context_rows + size_t(dp.pos0 - 1)%context_rows;
                 const llama_embd context = { context_embd.data() + slot*n_embd_dec, 1, size_t(n_embd_dec) };
-                std::vector<float> state(markov_rank, 0.0f), logits;
+                rnn_state.assign(markov_rank, 0.0f);
                 llama_token prev = dp.id_last;
                 for (int32_t i = 1; i < std::min(n_block_tokens, params.n_max + 1); ++i) {
                     const size_t row = beg + i;
                     if (!llama_draft_step(ctx_dft, prev,
                             { hidden.data() + row*n_embd_dec, 1, size_t(n_embd_dec) },
-                            { base_logits.data() + row*n_vocab, 1, size_t(n_vocab) }, context, state, logits)) {
+                            { base_logits.data() + row*n_vocab, 1, size_t(n_vocab) }, context, rnn_state, rnn_logits)) {
                         result.clear();
                         if (dp.result_q) {
                             dp.result_q->clear();
@@ -1581,22 +1601,30 @@ public:
                         LOG_ERR("%s: DSpark recurrent head failed\n", __func__);
                         break;
                     }
-                    const float maximum = *std::max_element(logits.begin(), logits.end());
+                    float maximum = rnn_logits[0];
+                    llama_token best_id = 0;
+                    for (int32_t k = 1; k < n_vocab; ++k) {
+                        if (rnn_logits[k] > maximum) {
+                            maximum = rnn_logits[k];
+                            best_id = k;
+                        }
+                    }
                     std::vector<llama_token_data> q(n_vocab);
                     double sum = 0.0;
                     for (int32_t k = 0; k < n_vocab; ++k) {
-                        const float p = std::exp((logits[k] - maximum)/temp);
-                        q[k] = { k, logits[k], p };
+                        const float p = std::exp((rnn_logits[k] - maximum)*inv_temp);
+                        q[k] = { k, rnn_logits[k], p };
                         sum += p;
                     }
                     if (!std::isfinite(sum) || sum <= 0.0) {
                         throw std::runtime_error("DSpark produced non-finite proposal probabilities");
                     }
+                    const double inv_sum = 1.0 / sum;
                     for (auto & candidate : q) {
-                        candidate.p /= sum;
+                        candidate.p = (float) (candidate.p * inv_sum);
                     }
                     double u = std::uniform_real_distribution<double>(0.0, 1.0)(rnn_rng[seq_id]);
-                    prev = std::max_element(logits.begin(), logits.end()) - logits.begin();
+                    prev = best_id;
                     for (const auto & candidate : q) {
                         u -= candidate.p;
                         if (u < 0.0) {
@@ -1623,13 +1651,17 @@ public:
                     break;
                 }
 
-                const llama_token sampled = common_sampler_sample(smpl, ctx_dft, idx, true);
                 if (has_rnn_context) {
-                    // Use the first maximum, as in the RNN conditioning graph.
+                    llama_token sampled = llama_get_sampled_token_ith(ctx_dft, idx);
+                    if (sampled == LLAMA_TOKEN_NULL) {
+                        sampled = common_sampler_sample(smpl, ctx_dft, idx, true);
+                    }
                     common_sampler_accept(smpl, sampled, true);
                     result.push_back(sampled);
                     continue;
                 }
+
+                common_sampler_sample(smpl, ctx_dft, idx, true);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -3327,8 +3359,11 @@ common_speculative_init_result::common_speculative_init_result(
             char block_meta[32] = {};
             llama_model_meta_val_str(model_dft, "dflash.block_size", block_meta, sizeof(block_meta));
             const uint32_t block = std::stoul(block_meta);
-            cparams.n_outputs_max_per_seq = std::max(cparams.n_outputs_max_per_seq, block);
-            cparams.n_outputs_max = std::max(cparams.n_outputs_max, block * params.n_parallel);
+            const uint32_t per_seq = params.speculative.draft.probabilistic
+                    ? block
+                    : std::min<uint32_t>(block, std::max<int32_t>(1, params.speculative.draft.n_max));
+            cparams.n_outputs_max_per_seq = std::max(cparams.n_outputs_max_per_seq, per_seq);
+            cparams.n_outputs_max = std::max(cparams.n_outputs_max, per_seq * params.n_parallel);
             cparams.n_batch = std::max(cparams.n_batch, block * params.n_parallel);
             cparams.n_ubatch = std::max(cparams.n_ubatch, block);
         }

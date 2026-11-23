@@ -898,6 +898,9 @@ struct llm_graph_params {
     ggml_tensor * h_nextn_dev   = nullptr; // own h_nextn device buffer (write)
     ggml_tensor * h_nextn_src   = nullptr; // ctx_state_src's h_nextn device buffer (read)
     ggml_tensor * dspark_w2_eff = nullptr; // precomputed target.output @ dspark_hidden_out
+    ggml_tensor * dspark_jp_dyn = nullptr; // contiguous split of dspark_joint_proj [2*rank, 3*rank]
+    ggml_tensor * dspark_jp_hid = nullptr; // contiguous split of dspark_joint_proj [n_embd, 3*rank]
+    ggml_tensor * dspark_jp_ctx = nullptr; // contiguous split of dspark_joint_proj [n_embd, 3*rank]
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -996,6 +999,9 @@ struct llm_graph_params {
             h_nextn_dev   == other.h_nextn_dev   &&
             h_nextn_src   == other.h_nextn_src   &&
             dspark_w2_eff == other.dspark_w2_eff &&
+            dspark_jp_dyn == other.dspark_jp_dyn &&
+            dspark_jp_hid == other.dspark_jp_hid &&
+            dspark_jp_ctx == other.dspark_jp_ctx &&
             model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1176,6 +1182,9 @@ struct llm_graph_context {
     ggml_tensor * h_nextn_dev;
     ggml_tensor * h_nextn_src;
     ggml_tensor * dspark_w2_eff;
+    ggml_tensor * dspark_jp_dyn;
+    ggml_tensor * dspark_jp_hid;
+    ggml_tensor * dspark_jp_ctx;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

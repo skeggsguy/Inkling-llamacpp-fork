@@ -1783,6 +1783,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     h_nextn_dev      (params.h_nextn_dev),
     h_nextn_src      (params.h_nextn_src),
     dspark_w2_eff    (params.dspark_w2_eff),
+    dspark_jp_dyn    (params.dspark_jp_dyn),
+    dspark_jp_hid    (params.dspark_jp_hid),
+    dspark_jp_ctx    (params.dspark_jp_ctx),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -4884,7 +4887,8 @@ void llm_graph_context::build_sampling() const {
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
             }
 
-            if (data.logits != nullptr) {
+            // skip copying unmodified full-vocab logits when a terminal backend sampler already produced a token
+            if (data.logits != nullptr && (data.sampled == nullptr || data.logits != logits_seq)) {
                 if (active) {
                     res->t_sampled_logits[row] = data.logits;
                 }

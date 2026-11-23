@@ -1678,8 +1678,12 @@ void llama_context::dspark_w2_eff_init() {
 
     const int64_t t_start_us = ggml_time_us();
 
+    const bool has_jp = model.dspark_joint_proj != nullptr &&
+            model.dspark_joint_proj->ne[0] == 2*rank + 2*n_embd &&
+            model.dspark_joint_proj->ne[1] == 3*rank;
+
     ggml_init_params params = {
-        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_size   =*/ (has_jp ? 4 : 1) * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -1687,6 +1691,14 @@ void llama_context::dspark_w2_eff_init() {
 
     dspark_w2_eff = ggml_new_tensor_2d(ctx_dspark_w2.get(), GGML_TYPE_F16, rank, n_vocab_unpadded);
     ggml_set_name(dspark_w2_eff, "dspark_w2_eff");
+    if (has_jp) {
+        dspark_jp_dyn = ggml_new_tensor_2d(ctx_dspark_w2.get(), GGML_TYPE_F16, 2*rank, 3*rank);
+        dspark_jp_hid = ggml_new_tensor_2d(ctx_dspark_w2.get(), GGML_TYPE_F16, n_embd, 3*rank);
+        dspark_jp_ctx = ggml_new_tensor_2d(ctx_dspark_w2.get(), GGML_TYPE_F16, n_embd, 3*rank);
+        ggml_set_name(dspark_jp_dyn, "dspark_jp_dyn");
+        ggml_set_name(dspark_jp_hid, "dspark_jp_hid");
+        ggml_set_name(dspark_jp_ctx, "dspark_jp_ctx");
+    }
 
     ggml_backend_dev_t dev = model.dev_output();
     auto * buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
@@ -1695,6 +1707,9 @@ void llama_context::dspark_w2_eff_init() {
     auto reset_fail = [&](const char * why) {
         LLAMA_LOG_WARN("%s: %s, falling back to target.output\n", func, why);
         dspark_w2_eff = nullptr;
+        dspark_jp_dyn = nullptr;
+        dspark_jp_hid = nullptr;
+        dspark_jp_ctx = nullptr;
         buf_dspark_w2.reset();
         ctx_dspark_w2.reset();
     };
@@ -1705,6 +1720,21 @@ void llama_context::dspark_w2_eff_init() {
         return;
     }
 
+    ggml_init_params ht_params = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ht(ggml_init(ht_params));
+    ggml_tensor * h_t_dev = ggml_new_tensor_2d(ctx_ht.get(), GGML_TYPE_F32, n_embd, rank);
+    ggml_backend_dev_t dev_tgt = target->dev_output();
+    auto * buft_ht = dev_tgt ? ggml_backend_dev_buffer_type(dev_tgt) : ggml_backend_cpu_buffer_type();
+    ggml_backend_buffer_ptr buf_ht(ggml_backend_alloc_ctx_tensors_from_buft(ctx_ht.get(), buft_ht));
+    if (!buf_ht) {
+        reset_fail("failed to allocate temp h_t buffer");
+        return;
+    }
+
     ggml_backend_sched_ptr sched_tmp(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 64, false, cparams.op_offload));
     if (!sched_tmp) {
@@ -1712,10 +1742,43 @@ void llama_context::dspark_w2_eff_init() {
         return;
     }
 
+    // extract h_t = dspark_hidden_out^T [n_embd, rank] via mul_mat with identity (handles CPU_REPACK and all quant types)
+    {
+        ggml_init_params tmp_params = {
+            /*.mem_size   =*/ 16*ggml_tensor_overhead() + ggml_graph_overhead_custom(64, false),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_tmp(ggml_init(tmp_params));
+        ggml_cgraph * gf_tmp = ggml_new_graph_custom(ctx_tmp.get(), 64, false);
+
+        ggml_tensor * eye = ggml_new_tensor_2d(ctx_tmp.get(), GGML_TYPE_F32, rank, rank);
+        ggml_set_input(eye);
+        ggml_tensor * h_t = ggml_mul_mat(ctx_tmp.get(), model.dspark_hidden_out, eye);
+        ggml_prec_set_acc(h_t, GGML_PREC_F32);
+        ggml_build_forward_expand(gf_tmp, ggml_cpy(ctx_tmp.get(), h_t, h_t_dev));
+
+        ggml_backend_sched_reset(sched_tmp.get());
+        if (!ggml_backend_sched_alloc_graph(sched_tmp.get(), gf_tmp)) {
+            reset_fail("failed to alloc h_t graph");
+            return;
+        }
+        std::vector<float> eye_host((size_t) rank * rank, 0.0f);
+        for (int64_t r = 0; r < rank; ++r) {
+            eye_host[(size_t) r * rank + r] = 1.0f;
+        }
+        ggml_backend_tensor_set(eye, eye_host.data(), 0, eye_host.size() * sizeof(float));
+        if (ggml_backend_sched_graph_compute(sched_tmp.get(), gf_tmp) != GGML_STATUS_SUCCESS) {
+            reset_fail("failed to compute h_t");
+            return;
+        }
+    }
+
     // chunk over vocabulary rows to bound peak temporary compute memory
     const int64_t n_chunk_max = 32768;
     for (int64_t row0 = 0; row0 < n_vocab_unpadded; row0 += n_chunk_max) {
-        const int64_t n_rows = std::min<int64_t>(n_chunk_max, n_vocab_unpadded - row0);
+        const int64_t n_rows     = std::min<int64_t>(n_chunk_max, n_vocab_unpadded - row0);
+        const int64_t n_rows_pad = std::min<int64_t>(target->output->ne[1] - row0, (n_rows + 15) & ~int64_t(15));
 
         ggml_init_params tmp_params = {
             /*.mem_size   =*/ 32*ggml_tensor_overhead() + ggml_graph_overhead_custom(64, false),
@@ -1726,14 +1789,12 @@ void llama_context::dspark_w2_eff_init() {
         ggml_cgraph * gf_tmp = ggml_new_graph_custom(ctx_tmp.get(), 64, false);
 
         ggml_tensor * out_w = ggml_view_2d(ctx_tmp.get(), target->output,
-                n_embd, n_rows, target->output->nb[1], (size_t) row0 * target->output->nb[1]);
-        ggml_tensor * h_out = model.dspark_hidden_out;
-        if (h_out->type != GGML_TYPE_F32) {
-            h_out = ggml_cast(ctx_tmp.get(), h_out, GGML_TYPE_F32);
-        }
-        ggml_tensor * h_t = ggml_cont(ctx_tmp.get(), ggml_transpose(ctx_tmp.get(), h_out));
-        ggml_tensor * prod = ggml_mul_mat(ctx_tmp.get(), out_w, h_t);
+                n_embd, n_rows_pad, target->output->nb[1], (size_t) row0 * target->output->nb[1]);
+        ggml_tensor * prod = ggml_mul_mat(ctx_tmp.get(), out_w, h_t_dev);
         ggml_prec_set_acc(prod, GGML_PREC_F32);
+        if (n_rows_pad != n_rows) {
+            prod = ggml_view_2d(ctx_tmp.get(), prod, n_rows, rank, prod->nb[1], 0);
+        }
         ggml_tensor * prod_t = ggml_cont(ctx_tmp.get(), ggml_transpose(ctx_tmp.get(), prod));
         ggml_tensor * dst_chunk = ggml_view_2d(ctx_tmp.get(), dspark_w2_eff,
                 rank, n_rows, dspark_w2_eff->nb[1], (size_t) row0 * dspark_w2_eff->nb[1]);
@@ -1744,6 +1805,60 @@ void llama_context::dspark_w2_eff_init() {
                 ggml_backend_sched_graph_compute(sched_tmp.get(), gf_tmp) != GGML_STATUS_SUCCESS) {
             reset_fail("failed to compute dspark_w2_eff");
             return;
+        }
+    }
+
+    if (has_jp) {
+        const int64_t jp_cols = 2*rank + 2*n_embd;
+        const int64_t jp_rows = 3*rank;
+        const int64_t c_chunk_max = 512;
+        bool jp_ok = true;
+
+        auto extract_jp_slice = [&](int64_t col0, int64_t width, ggml_tensor * dst) -> bool {
+            for (int64_t c0 = 0; c0 < width; c0 += c_chunk_max) {
+                const int64_t c_len = std::min<int64_t>(c_chunk_max, width - c0);
+
+                ggml_init_params tmp_params = {
+                    /*.mem_size   =*/ 32*ggml_tensor_overhead() + ggml_graph_overhead_custom(64, false),
+                    /*.mem_buffer =*/ nullptr,
+                    /*.no_alloc   =*/ true,
+                };
+                ggml_context_ptr ctx_tmp(ggml_init(tmp_params));
+                ggml_cgraph * gf_tmp = ggml_new_graph_custom(ctx_tmp.get(), 64, false);
+
+                ggml_tensor * e_chunk = ggml_new_tensor_2d(ctx_tmp.get(), GGML_TYPE_F32, jp_cols, c_len);
+                ggml_set_input(e_chunk);
+                ggml_tensor * prod = ggml_mul_mat(ctx_tmp.get(), model.dspark_joint_proj, e_chunk);
+                ggml_prec_set_acc(prod, GGML_PREC_F32);
+                ggml_tensor * prod_t = ggml_cont(ctx_tmp.get(), ggml_transpose(ctx_tmp.get(), prod));
+                ggml_tensor * dst_sub = ggml_view_2d(ctx_tmp.get(), dst,
+                        c_len, jp_rows, dst->nb[1], (size_t) c0 * dst->nb[0]);
+                ggml_build_forward_expand(gf_tmp, ggml_cpy(ctx_tmp.get(), prod_t, dst_sub));
+
+                ggml_backend_sched_reset(sched_tmp.get());
+                if (!ggml_backend_sched_alloc_graph(sched_tmp.get(), gf_tmp)) {
+                    return false;
+                }
+                std::vector<float> e_host((size_t) jp_cols * c_len, 0.0f);
+                for (int64_t j = 0; j < c_len; ++j) {
+                    e_host[(size_t) j * jp_cols + col0 + c0 + j] = 1.0f;
+                }
+                ggml_backend_tensor_set(e_chunk, e_host.data(), 0, e_host.size() * sizeof(float));
+                if (ggml_backend_sched_graph_compute(sched_tmp.get(), gf_tmp) != GGML_STATUS_SUCCESS) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        jp_ok = jp_ok && extract_jp_slice(0,               2*rank, dspark_jp_dyn);
+        jp_ok = jp_ok && extract_jp_slice(2*rank,          n_embd, dspark_jp_hid);
+        jp_ok = jp_ok && extract_jp_slice(2*rank + n_embd, n_embd, dspark_jp_ctx);
+
+        if (!jp_ok) {
+            dspark_jp_dyn = nullptr;
+            dspark_jp_hid = nullptr;
+            dspark_jp_ctx = nullptr;
         }
     }
 
@@ -2769,10 +2884,15 @@ bool llama_context::draft_step(llama_token token, llama_embd hidden, llama_embd 
         return false;
     }
     synchronize();
-    std::vector<float> inputs(state);
-    inputs.insert(inputs.end(), hidden.data, hidden.data + width);
-    inputs.insert(inputs.end(), context.data, context.data + width);
-    inputs.insert(inputs.end(), base.data, base.data + vocab);
+    draft_step_inputs.resize(state.size() + 2*width + vocab);
+    float * dst = draft_step_inputs.data();
+    std::memcpy(dst, state.data(), state.size()*sizeof(float));
+    dst += state.size();
+    std::memcpy(dst, hidden.data, width*sizeof(float));
+    dst += width;
+    std::memcpy(dst, context.data, width*sizeof(float));
+    dst += width;
+    std::memcpy(dst, base.data, vocab*sizeof(float));
 
     llama_batch_ext batch(this);
     batch.mem = nullptr;
@@ -2783,7 +2903,7 @@ bool llama_context::draft_step(llama_token token, llama_embd hidden, llama_embd 
         return false;
     }
     auto ubatch = balloc->split_simple(1);
-    ubatch.embd_state = inputs.data();
+    ubatch.embd_state = draft_step_inputs.data();
     n_outputs = 1;
     ggml_status status;
     const auto * result = process_ubatch(ubatch, LLM_GRAPH_TYPE_DRAFT_HEAD, nullptr, status);
@@ -3262,6 +3382,9 @@ llm_graph_params llama_context::graph_params(
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
         /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
         /*.dspark_w2_eff =*/ (!loras || loras->empty()) ? dspark_w2_eff : nullptr,
+        /*.dspark_jp_dyn =*/ (!loras || loras->empty()) ? dspark_jp_dyn : nullptr,
+        /*.dspark_jp_hid =*/ (!loras || loras->empty()) ? dspark_jp_hid : nullptr,
+        /*.dspark_jp_ctx =*/ (!loras || loras->empty()) ? dspark_jp_ctx : nullptr,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

@@ -491,10 +491,16 @@ private:
     bool ev_h_nextn_written_recorded = false;
     bool ev_h_nextn_read_recorded    = false;
 
-    // precomputed target.output[:n_vocab_unpadded] @ dspark_hidden_out, F16 [markov_rank, n_vocab_unpadded]
+    // precomputed Inkling2 DSpark weights on device:
+    //   dspark_w2_eff: target.output[:n_vocab_unpadded] @ dspark_hidden_out, F16 [markov_rank, n_vocab_unpadded]
+    //   dspark_jp_{dyn,hid,ctx}: contiguous F16 splits of dspark_joint_proj along dim 0
     ggml_context_ptr        ctx_dspark_w2;
     ggml_backend_buffer_ptr buf_dspark_w2;
     ggml_tensor *           dspark_w2_eff = nullptr;
+    ggml_tensor *           dspark_jp_dyn = nullptr;
+    ggml_tensor *           dspark_jp_hid = nullptr;
+    ggml_tensor *           dspark_jp_ctx = nullptr;
+    std::vector<float>      draft_step_inputs;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
