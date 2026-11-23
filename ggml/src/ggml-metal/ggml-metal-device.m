@@ -1825,7 +1825,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
         case GGML_OP_FLASH_ATTN_EXT_BANDED:
             {
-                // runs on the half8x8 kernel for any number of queries
+                // no vec kernel: the half8x8 or tensor kernel runs for any number of queries
                 const struct ggml_tensor * mask  = op->src[3];
                 const struct ggml_tensor * sinks = op->src[4];
                 const struct ggml_tensor * rel   = op->src[6];
@@ -1851,7 +1851,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     default:
                         return false;
                 }
-                if (rel->type != GGML_TYPE_F32 && rel->type != GGML_TYPE_F16 && !(rel->type == GGML_TYPE_BF16 && has_bfloat)) {
+                if (rel->type != GGML_TYPE_F32 && rel->type != GGML_TYPE_F16) {
                     return false;
                 }
                 if (rel->nb[0] != ggml_type_size(rel->type)) {

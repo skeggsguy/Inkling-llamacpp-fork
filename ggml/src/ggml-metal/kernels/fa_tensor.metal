@@ -9,18 +9,13 @@ constant bool FC_flash_attn_ext_tensor_has_scap  [[function_constant(FC_FLASH_AT
 constant bool FC_flash_attn_ext_tensor_has_rel   [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 4)]];
 constant bool FC_flash_attn_ext_tensor_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 5)]];
 
-// rel type: 0 - F32, 1 - F16, 2 - BF16
+// rel type: 0 - F32, 1 - F16
 constant int32_t FC_flash_attn_ext_tensor_rel_type [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 6)]];
 
 static inline float flash_attn_ext_tensor_rel_load(device const char * rel, int32_t i) {
     if (FC_flash_attn_ext_tensor_rel_type == 1) {
         return ((device const half *) rel)[i];
     }
-#if defined(GGML_METAL_HAS_BF16)
-    if (FC_flash_attn_ext_tensor_rel_type == 2) {
-        return ((device const bfloat *) rel)[i];
-    }
-#endif
     return ((device const float *) rel)[i];
 }
 
@@ -228,7 +223,7 @@ kernel void kernel_flash_attn_ext_tensor(
             }
 
             // banded: the distance of column ic0*C + ii*NW + tiisg is dmax - ii*NW - tiisg
-            // note: rel goes in before the max, so that P stays within e^8 in half
+            // add rel before the row max, else exp(s - M) can overflow
             if (FC_flash_attn_ext_tensor_has_rel) {
                 const int dmax = iq1 + j + args.q_off - ic0*C;
 

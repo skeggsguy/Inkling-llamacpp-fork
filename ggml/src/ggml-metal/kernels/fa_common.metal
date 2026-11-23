@@ -15,18 +15,13 @@ constant int32_t FC_flash_attn_ext_ns10 [[function_constant(FC_FLASH_ATTN_EXT + 
 constant int32_t FC_flash_attn_ext_ns20 [[function_constant(FC_FLASH_ATTN_EXT + 21)]];
 constant int32_t FC_flash_attn_ext_nsg  [[function_constant(FC_FLASH_ATTN_EXT + 22)]];
 
-// rel type: 0 - F32, 1 - F16, 2 - BF16
+// rel type: 0 - F32, 1 - F16
 constant int32_t FC_flash_attn_ext_rel_type [[function_constant(FC_FLASH_ATTN_EXT + 23)]];
 
 static inline float flash_attn_ext_rel_load(device const char * rel, int32_t i) {
     if (FC_flash_attn_ext_rel_type == 1) {
         return ((device const half *) rel)[i];
     }
-#if defined(GGML_METAL_HAS_BF16)
-    if (FC_flash_attn_ext_rel_type == 2) {
-        return ((device const bfloat *) rel)[i];
-    }
-#endif
     return ((device const float *) rel)[i];
 }
 

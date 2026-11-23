@@ -3636,10 +3636,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * rel = op->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? op->src[6] : nullptr;
     const bool has_rel = rel != nullptr;
 
+    GGML_ASSERT(!has_rel || rel->type == GGML_TYPE_F32 || rel->type == GGML_TYPE_F16);
     GGML_ASSERT(!has_rel || rel->nb[0] == ggml_type_size(rel->type));
 
-    // 0 - F32, 1 - F16, 2 - BF16
-    const int32_t rel_type = !has_rel || rel->type == GGML_TYPE_F32 ? 0 : rel->type == GGML_TYPE_F16 ? 1 : 2;
+    // 0 - F32, 1 - F16
+    const int32_t rel_type = has_rel && rel->type == GGML_TYPE_F16 ? 1 : 0;
 
     const int32_t  ne_r0 = has_rel ? (int32_t) rel->ne[0] : 0;
     const uint64_t nb_r1 = has_rel ? rel->nb[1] : 0;

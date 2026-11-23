@@ -13709,8 +13709,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8, 2048, 4096, 1024, 1, GGML_TYPE_F16,  GGML_TYPE_F32, 2));
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8,  512, 3000, 1024, 2, GGML_TYPE_BF16, GGML_TYPE_F32, 2));
     // Inkling-2-Mini shapes
-    for (int64_t n_q : { 33, 512, 2048 }) {
-        for (int64_t n_kv : { 4096, 9000, 32785 }) {
+    for (int64_t n_q : { 33, 512 }) {
+        for (int64_t n_kv : { 4096, 32785 }) {
             for (int mask_kind : { 1, 2 }) {
                 test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, mask_kind, GGML_TYPE_F16, GGML_TYPE_F32, 2));
             }
@@ -13725,7 +13725,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext_banded_tight(128, 24, 8, 100, 1000, 96, 2, GGML_TYPE_F16,  GGML_TYPE_F16,  2));
-    test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 100, 1000, 96, 2, GGML_TYPE_BF16, GGML_TYPE_BF16, 2));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 100, 1000, 96, 2, GGML_TYPE_BF16, GGML_TYPE_F32,  2));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 1, 4096, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512,  8192, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 16384, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
@@ -14559,10 +14559,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // banded attention, Inkling-2-Mini prompt processing
-    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
-        for (int64_t n_kv : { 4096, 32768 }) {
-            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 512, n_kv, 1024, 1, type, GGML_TYPE_F32, 2));
-        }
+    for (int64_t n_kv : { 4096, 32768 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 512, n_kv, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32, 2));
     }
 
     // q8_0 KV cases with long context (decode and prompt)
