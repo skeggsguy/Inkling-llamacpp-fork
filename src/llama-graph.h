@@ -27,6 +27,20 @@ class llama_moe_cache;
 
 struct llama_memory_context_i;
 
+// one or two contiguous cell runs covering the active banded window: [c0, c0 + n0) then [c1, c1 + n1)
+struct llama_kv_banded_span {
+    uint32_t c0 = 0;
+    uint32_t n0 = 0;
+    uint32_t c1 = 0;
+    uint32_t n1 = 0;
+
+    uint32_t total() const { return n0 + n1; }
+    bool valid() const { return n0 > 0; }
+    bool operator==(const llama_kv_banded_span & o) const {
+        return c0 == o.c0 && n0 == o.n0 && c1 == o.c1 && n1 == o.n1;
+    }
+};
+
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
 class llama_kv_cache_dsa_iswa_context;
@@ -822,9 +836,9 @@ public:
     ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };
     ggml_tensor * self_kq_mask_dev[2] = { nullptr, nullptr };
 
-    // [base, swa] K/V cells of the banded attention, 0 = dense
-    uint32_t n_kv_banded[2] = { 0, 0 };
-    bool     banded         = false;
+    // [base, swa] K/V cell spans of the banded attention, invalid = dense
+    llama_kv_banded_span banded_span[2] = {};
+    bool                 banded         = false;
 
     const uint32_t extent;
     const uint32_t extent_swa;

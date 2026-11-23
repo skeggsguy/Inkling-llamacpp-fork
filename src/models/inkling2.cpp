@@ -294,10 +294,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     auto * inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
     auto * attn = inp->get_attn();
-    // banded FA needs a position-contiguous cache; small ubatches stay dense for graph reuse
+    // banded FA needs a position-contiguous cache (or 2-run SWA wrap); small ubatches stay dense for graph reuse
     inp->banded = cparams.flash_attn && n_tokens > n_tokens_banded_min;
     for (int i = 0; i < 2 && inp->banded; ++i) {
-        inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
+        inp->banded_span[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_kv_banded_span();
     }
     std::vector<std::pair<std::pair<bool, ggml_backend_dev_t>, bool>> banded_dev_ok;
     const auto use_banded = [&](int il, bool swa) {
@@ -306,7 +306,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         const auto type_ok = [](ggml_type t) {
             return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || ggml_is_quantized(t);
         };
-        if (!(inp->n_kv_banded[swa] > 0 && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
+        if (!(inp->banded_span[swa].valid() && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
                 type_ok(cache->type_k()) && type_ok(cache->type_v()) && !cache->get_k_scale(il) && !cache->get_v_scale(il) &&
                 (swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3] == 1)) {
             return false;
@@ -493,28 +493,47 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 ggml_build_forward_expand(gf, cache->cpy_k(ctx0, Kcur, is_swa ? attn->get_k_idxs_swa() : attn->get_k_idxs(), il));
                 ggml_build_forward_expand(gf, cache->cpy_v(ctx0, Vcur, is_swa ? attn->get_v_idxs_swa() : attn->get_v_idxs(), il));
 
-                const int64_t n_kv_b = inp->n_kv_banded[is_swa];
+                const llama_kv_banded_span span = inp->banded_span[is_swa];
                 ggml_tensor * k_all = cache->get_k(ctx0, il);
                 ggml_tensor * v_all = cache->get_v(ctx0, il);
-                GGML_ASSERT(n_kv_b <= k_all->ne[2]);
+                GGML_ASSERT(span.c0 + span.n0 <= (uint32_t) k_all->ne[2]);
+                GGML_ASSERT(span.n1 == 0 || span.c1 + span.n1 <= (uint32_t) k_all->ne[2]);
                 ggml_tensor * q_fa = ggml_permute(ctx0, ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_tokens, 1), 0, 2, 1, 3);
-                ggml_tensor * k_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], n_kv_b, k_all->ne[3],
-                        k_all->nb[1], k_all->nb[2], k_all->nb[3], 0), 0, 2, 1, 3);
+                auto slice_kv = [&](ggml_tensor * t, uint32_t c, uint32_t n) {
+                    return ggml_view_4d(ctx0, t, t->ne[0], t->ne[1], n, t->ne[3],
+                            t->nb[1], t->nb[2], t->nb[3], (size_t) c * t->nb[2]);
+                };
+                ggml_tensor * k_view = span.n1 == 0
+                        ? slice_kv(k_all, span.c0, span.n0)
+                        : ggml_concat(ctx0, slice_kv(k_all, span.c0, span.n0), slice_kv(k_all, span.c1, span.n1), 2);
+                ggml_tensor * k_fa = ggml_permute(ctx0, k_view, 0, 2, 1, 3);
                 ggml_tensor * v_fa;
                 if (v_all->nb[1] > v_all->nb[2]) { // transposed V
-                    v_fa = ggml_view_4d(ctx0, v_all, n_kv_b, v_all->ne[1], v_all->ne[2], v_all->ne[3],
-                            v_all->nb[1], v_all->nb[2], v_all->nb[3], 0);
-                    v_fa = ggml_transpose(ctx0, ggml_permute(ctx0, v_fa, 0, 2, 1, 3));
+                    auto slice_vt = [&](uint32_t c, uint32_t n) {
+                        return ggml_view_4d(ctx0, v_all, n, v_all->ne[1], v_all->ne[2], v_all->ne[3],
+                                v_all->nb[1], v_all->nb[2], v_all->nb[3], (size_t) c * v_all->nb[0]);
+                    };
+                    ggml_tensor * v_view = span.n1 == 0
+                            ? slice_vt(span.c0, span.n0)
+                            : ggml_concat(ctx0, slice_vt(span.c0, span.n0), slice_vt(span.c1, span.n1), 0);
+                    v_fa = ggml_transpose(ctx0, ggml_permute(ctx0, v_view, 0, 2, 1, 3));
                 } else {
-                    v_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], n_kv_b, v_all->ne[3],
-                            v_all->nb[1], v_all->nb[2], v_all->nb[3], 0), 0, 2, 1, 3);
+                    ggml_tensor * v_view = span.n1 == 0
+                            ? slice_kv(v_all, span.c0, span.n0)
+                            : ggml_concat(ctx0, slice_kv(v_all, span.c0, span.n0), slice_kv(v_all, span.c1, span.n1), 2);
+                    v_fa = ggml_permute(ctx0, v_view, 0, 2, 1, 3);
                 }
                 // one sliced mask per cache: each view of the host mask is a separate device copy
                 ggml_tensor *& m = mask_banded[is_swa];
                 if (!m) {
                     ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
-                    m = ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
-                            mask->nb[1], mask->nb[2], mask->nb[3], 0));
+                    auto slice_m = [&](uint32_t c, uint32_t n) {
+                        return ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n, mask->ne[1], mask->ne[2], mask->ne[3],
+                                mask->nb[1], mask->nb[2], mask->nb[3], (size_t) c * mask->nb[0]));
+                    };
+                    m = span.n1 == 0
+                            ? slice_m(span.c0, span.n0)
+                            : ggml_concat(ctx0, slice_m(span.c0, span.n0), slice_m(span.c1, span.n1), 0);
                 }
                 // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
                 ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);

@@ -1310,49 +1310,113 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
-uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const {
+llama_kv_banded_span llama_kv_cache::get_kv_banded_span(const slot_info & sinfo, const llama_ubatch & ubatch) const {
     if (sinfo.n_stream() != 1 || ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0 ||
         ubatch.pos == nullptr || ubatch.n_seq_id == nullptr ||
         ubatch.seq_id == nullptr || ubatch.seq_id[0] == nullptr) {
-        return 0;
+        return {};
     }
 
     const llama_seq_id seq_id = ubatch.seq_id[0][0];
     if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
-        return 0;
+        return {};
     }
 
     const uint32_t stream = seq_to_stream[seq_id];
     if (sinfo.strm[0] < 0 || (uint32_t) sinfo.strm[0] != stream || stream >= v_cells.size()) {
-        return 0;
+        return {};
     }
 
     const auto & cells = v_cells[stream];
     const llama_pos pos_max = cells.seq_pos_max(seq_id);
 
-    if (pos_max < 0 || pos_max >= (llama_pos) cells.size()) {
-        return 0;
+    if (pos_max < 0) {
+        return {};
     }
 
     // the banded op aligns Q to the tail of K: the ubatch must be that monotonic tail, else dense bias
-    if ((uint32_t) pos_max + 1 < ubatch.n_tokens) {
-        return 0;
+    if ((uint64_t) pos_max + 1 < ubatch.n_tokens) {
+        return {};
     }
     const llama_pos pos_start = pos_max + 1 - ubatch.n_tokens;
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         if (ubatch.pos[i] != pos_start + (llama_pos) i ||
             ubatch.n_seq_id[i] < 1 || ubatch.seq_id[i] == nullptr || ubatch.seq_id[i][0] != seq_id) {
-            return 0;
+            return {};
         }
     }
 
-    for (llama_pos pos = 0; pos <= pos_max; ++pos) {
-        if (cells.is_empty(pos) || cells.pos_get(pos) != pos || !cells.seq_has(pos, seq_id)) {
-            return 0;
+    // standard SWA masks keys below p_min, so only p_min..pos_max are active
+    llama_pos p_min = 0;
+    if (n_swa > 0 && swa_type == LLAMA_SWA_TYPE_STANDARD && pos_start >= (llama_pos) n_swa) {
+        p_min = pos_start - (llama_pos) n_swa + 1;
+    }
+
+    const uint64_t n_span = (uint64_t) (pos_max - p_min) + 1;
+    if (n_span > cells.size()) {
+        return {};
+    }
+
+    const uint32_t n_active = p_min == 0 ? cells.seq_n_cells(seq_id) : cells.seq_n_cells(seq_id, p_min);
+    if (n_active != (uint32_t) n_span) {
+        return {};
+    }
+
+    uint32_t c0 = 0;
+    while (c0 < cells.size() && (cells.is_empty(c0) || !cells.seq_has(c0, seq_id) || cells.pos_get(c0) != p_min)) {
+        ++c0;
+    }
+    if (c0 >= cells.size()) {
+        return {};
+    }
+
+    uint32_t n0 = 0;
+    while ((uint64_t) n0 < n_span && c0 + n0 < cells.size()) {
+        const uint32_t i = c0 + n0;
+        if (cells.is_empty(i) || !cells.seq_has(i, seq_id) || cells.pos_get(i) != p_min + (llama_pos) n0) {
+            break;
+        }
+        ++n0;
+    }
+
+    uint32_t c1 = 0;
+    uint32_t n1 = 0;
+    if (n0 < (uint32_t) n_span) {
+        // only stitch 2-piece wraps for SWA so we never concat a large full-attention cache
+        if (n_swa == 0) {
+            return {};
+        }
+        const llama_pos p_mid = p_min + (llama_pos) n0;
+        n1 = (uint32_t) n_span - n0;
+        while (c1 < cells.size() && (cells.is_empty(c1) || !cells.seq_has(c1, seq_id) || cells.pos_get(c1) != p_mid)) {
+            ++c1;
+        }
+        if ((uint64_t) c1 + n1 > cells.size()) {
+            return {};
+        }
+        for (uint32_t k = 0; k < n1; ++k) {
+            const uint32_t i = c1 + k;
+            if (cells.is_empty(i) || !cells.seq_has(i, seq_id) || cells.pos_get(i) != p_mid + (llama_pos) k) {
+                return {};
+            }
         }
     }
 
-    return pos_max + 1;
+    // keep view offsets 4-byte aligned for F16 masks by prepending 1 already-masked cell if c0 is odd
+    if ((c0 & 1) && c0 > 0 && (n1 == 0 || c0 - 1 < c1 || c0 - 1 >= c1 + n1)) {
+        --c0;
+        ++n0;
+    }
+    if ((c0 & 1) || (n1 > 0 && (c1 & 1))) {
+        return {};
+    }
+
+    return { c0, n0, c1, n1 };
+}
+
+uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const {
+    const llama_kv_banded_span span = get_kv_banded_span(sinfo, ubatch);
+    return (span.valid() && span.n1 == 0) ? span.c0 + span.n0 : 0;
 }
 
 uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
@@ -3134,17 +3198,25 @@ uint32_t llama_kv_cache_context::get_size() const {
     return kv->get_size();
 }
 
-uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
+llama_kv_banded_span llama_kv_cache_context::get_kv_banded_span() const {
     if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
         // reserve the banded path; the dense fallback is unallocatable at large n_ctx
         if (kv != nullptr && lctx == nullptr && kv->get_n_stream() == 1) {
-            return n_kv;
+            return { 0, (uint32_t) n_kv, 0, 0 };
         }
-        return 0;
+        return {};
     }
 
-    const uint32_t result = kv->get_n_kv_pos_contiguous(sinfos[i_cur], ubatches[i_cur]);
-    return result <= (uint32_t) n_kv ? result : 0;
+    const llama_kv_banded_span span = kv->get_kv_banded_span(sinfos[i_cur], ubatches[i_cur]);
+    if (!span.valid() || span.c0 + span.n0 > (uint32_t) n_kv || (span.n1 > 0 && span.c1 + span.n1 > (uint32_t) n_kv)) {
+        return {};
+    }
+    return span;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
+    const llama_kv_banded_span span = get_kv_banded_span();
+    return (span.valid() && span.n1 == 0) ? span.c0 + span.n0 : 0;
 }
 
 uint32_t llama_kv_cache_context::get_n_kv_rows() const {
