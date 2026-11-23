@@ -3505,10 +3505,9 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
 size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
 
-    // note: always reserve the temp buffer to avoid graph reallocations
-    //if (!ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
-    //    return 0;
-    //}
+    if (!ggml_is_quantized(op->src[1]->type) || ggml_metal_op_flash_attn_ext_use_vec(op)) {
+        return 0;
+    }
 
     GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
 
@@ -3550,7 +3549,7 @@ size_t ggml_metal_op_flash_attn_ext_extra_rows(const ggml_tensor * op) {
 
     const ggml_tensor * kv_rows = op->src[5];
 
-    if (!kv_rows) {
+    if (!kv_rows || ggml_metal_op_flash_attn_ext_use_vec(op)) {
         return 0;
     }
 
