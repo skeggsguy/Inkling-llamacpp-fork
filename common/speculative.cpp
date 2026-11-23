@@ -1490,6 +1490,8 @@ public:
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        const bool sample_rnn = has_rnn_context && params.probabilistic;
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1506,7 +1508,9 @@ public:
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
+                // In greedy Inkling2 mode, mark only slots 1..n_draft as output so the Markov loop stops at n_draft.
+                const bool need_output = !has_rnn_context || sample_rnn || (i >= 1 && i <= n_draft);
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, need_output);
                 if (has_rnn_context) {
                     // the context features of the committed anchor condition the recurrent head
                     const llama_pos pos = dp.pos0 - 1;
@@ -1523,7 +1527,6 @@ public:
             return;
         }
 
-        const bool sample_rnn = has_rnn_context && params.probabilistic;
         // decode all sequence's noise block in a single batch
         int ret = sample_rnn ? llama_draft_backbone(ctx_dft, batch.get())
                              : llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());

@@ -967,15 +967,15 @@ struct llm_graph_params {
             return false;
         }
 
-        if (samplers.size() > 0) {
+        if (samplers.size() > 0 || (n_outputs > 0 && n_outputs < ubatch.n_tokens)) {
             if (!ubatch.data || !other.ubatch.data) {
                 return false;
             }
 
-            // check that the outputs are the same for all samplers
+            // check that the outputs are the same for partial-output graphs and samplers
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 if (ubatch.output[i]    != other.ubatch.output[i] ||
-                    ubatch.seq_id[i][0] != other.ubatch.seq_id[i][0]) {
+                    (samplers.size() > 0 && ubatch.seq_id[i][0] != other.ubatch.seq_id[i][0])) {
                     return false;
                 }
             }

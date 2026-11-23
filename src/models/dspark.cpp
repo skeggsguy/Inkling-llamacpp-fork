@@ -1096,11 +1096,65 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     if (dspark_w2_eff && out_w->ne[1] != hparams.n_vocab_unpadded) {
         out_w = ggml_view_2d(ctx0, out_w, n_embd, hparams.n_vocab_unpadded, out_w->nb[1], 0);
     }
+    const bool is_backbone_only = params.gtype == LLM_GRAPH_TYPE_DRAFT_BACKBONE || block > hparams.dflash_block_size;
+    // Detect uniform 1..n_draft output prefix across all blocks so we skip unneeded Markov steps and slot 0.
+    int64_t n_draft = 0;
+    if (!is_backbone_only && block > 1 && ubatch.output && n_outputs > 0 && n_outputs % nb == 0) {
+        const int64_t k = n_outputs / nb;
+        if (k >= 1 && k < block) {
+            bool ok = true;
+            for (int64_t b = 0; b < nb && ok; ++b) {
+                for (int64_t i = 0; i < block; ++i) {
+                    const bool want = (i >= 1 && i <= k);
+                    if ((ubatch.output[b*block + i] != 0) != want) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if (ok) {
+                n_draft = k;
+            }
+        }
+    }
+    if (n_draft > 0) {
+        auto * cur_3d = ggml_reshape_3d(ctx0, cur, n_embd, block, nb);
+        auto * cur_draft = ggml_cont(ctx0, ggml_view_3d(ctx0, cur_3d, n_embd, n_draft, nb, cur_3d->nb[1], cur_3d->nb[2], cur_3d->nb[1]));
+        cur_draft = ggml_reshape_2d(ctx0, cur_draft, n_embd, n_draft*nb);
+        ggml_tensor * base_inp = dspark_w2_eff ? ggml_add(ctx0, cur_draft, model.dspark_hidden_out_b) : cur_draft;
+        auto * base = build_lora_mm(out_w, base_inp, target->output_s);
+        ggml_prec_set_acc(base, GGML_PREC_F32);
+        auto * state = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
+        ggml_tensor * logits = nullptr;
+        const auto col_draft = [&](ggml_tensor * t, int64_t i) {
+            return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, n_draft*t->nb[1], i*t->nb[1]));
+        };
+        auto * context = ggml_cont(ctx0, ggml_view_2d(ctx0, f_rnn, f_rnn->ne[0], nb, block*f_rnn->nb[1], 0));
+        auto * prev = ids;
+        for (int64_t i = 0; i < n_draft; ++i) {
+            auto * col = build_inkling2_head(*this, model, *target, prev, state, col_draft(cur_draft, i), col_draft(base, i), context, dspark_w2_eff);
+            logits = logits ? ggml_concat(ctx0, logits, col, 1) : col;
+            if (i + 1 < n_draft) {
+                ggml_tensor * valid = col->ne[0] == hparams.n_vocab_unpadded
+                        ? col
+                        : ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
+                prev = ggml_argmax(ctx0, valid);
+            }
+        }
+        if (n_draft > 1) {
+            logits = ggml_reshape_3d(ctx0, logits, logits->ne[0], nb, n_draft);
+            logits = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, logits, 0, 2, 1, 3)), logits->ne[0], n_draft*nb);
+        }
+        res->t_logits = logits->ne[0] == hparams.n_vocab_unpadded
+                ? logits
+                : ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, n_draft*nb, logits->nb[1], 0));
+        return;
+    }
     // Fold target.output @ dspark_hidden_out_b into base when using precomputed dspark_w2_eff.
     ggml_tensor * base_inp = dspark_w2_eff ? ggml_add(ctx0, cur, model.dspark_hidden_out_b) : cur;
     auto * base = build_lora_mm(out_w, base_inp, target->output_s);
     ggml_prec_set_acc(base, GGML_PREC_F32);
-    if (params.gtype == LLM_GRAPH_TYPE_DRAFT_BACKBONE || block > hparams.dflash_block_size) {
+    if (is_backbone_only) {
         res->t_h_nextn = cur;
         res->t_logits = base->ne[0] == hparams.n_vocab_unpadded
                 ? base
