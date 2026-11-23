@@ -16,6 +16,8 @@ Separate clean PR 2 worktree: `/Users/tomskeggs/dev/llama.cpp-inkling-pr2` (bran
 | `39e7ab4ac` | Banded FA + SWA KV cache | Follow-up PR (`unslothai/llama.cpp`) | Active SWA window check + 2-run `ggml_concat` wrap-seam stitching for `FLASH_ATTN_EXT_BANDED` |
 | `a77861652` | GGML `argmax` (DSpark uplift #1) | Standalone PR (`ggml-org` / `unslothai`) | Deterministic first-index tie-breaking in `GGML_OP_ARGMAX` across CPU, CUDA, Metal, Vulkan + tests |
 | `8ad8d90f0` | DSpark (DSpark uplift #2) | Follow-up PR (`unslothai/llama.cpp`) | Precompute `dspark_w2_eff = target.output @ dspark_hidden_out`, simplify Markov chain argmax & unpadded vocab slicing |
+| `bc05d21ce` | Banded FA + non-unified KV | Follow-up PR (`unslothai/llama.cpp`) | Reserve banded FA graph for multi-stream non-unified KV (`n_stream > 1`), dropping `3x200K` compute reserve from `20.4 GiB` -> `3.26 GiB` |
+| `721e555b8` | Server scheduling | Optional PR / local tuning | Dynamic decode-priority chunked prefill (2 pure decode ticks per `128`-token prefill chunk while any slot writes; full `-b/-ub` when solo) |
 
 ---
 
@@ -81,6 +83,23 @@ Separate clean PR 2 worktree: `/Users/tomskeggs/dev/llama.cpp-inkling-pr2` (bran
   - Avoids extra `ggml_cont` view when `base`/`logits`/`col` already match `n_vocab_unpadded`.
 - **PR prep note:** Depends on PR 5 (`a77861652`) for deterministic first-index `ggml_argmax` tie-breaking. Benchmark DSpark draft latency (`dur(b,g,a)` / `tg` t/s) and verify zero acceptance-rate regression against fallback path before submitting.
 
+### 7. PR 7 Candidate: Multi-Stream Banded Reserve for Non-Unified KV (`bc05d21ce`)
+- **Files:** `src/llama-kv-cache.cpp`, `src/models/inkling2.cpp`.
+- **Problem:** Under unified KV (`-kvu`), concurrent writing + prefill caused the generating slot to append 1-4 tokens onto the end of the prefilling slot's cells, shredding its full-attention KV cache into fragments and kicking all 16 full-attention layers back to dense naive attention (`592 -> 180 t/s`, reallocating every batch). Switching to non-unified per-slot streams (`--no-kv-unified -np 3 -c 600000`) eliminates cross-slot shredding completely, but `sched_reserve()` previously only reserved the banded path when `kv->get_n_stream() == 1` and `mask->ne[3] == 1`, inflating non-unified `3x200K` compute reserve to **`20,413 MiB`**.
+- **Fix:**
+  - Relax `llama_kv_cache_context::get_kv_banded_span()` reserve branch to work for any `n_stream` (`kv != nullptr && lctx == nullptr`).
+  - Reshape `q_fa`, `rel_b`, and `sinks` by `n_q = n_tokens / n_stream` and `n_stream` in `inkling2.cpp` (allowing `n_stream > 1` during reserve; runtime banded still stays `n_stream == 1` per ubatch).
+- **Impact:** Non-unified `3x200K` (`-b 1024 -ub 1024`) MTL0 compute reserve dropped from `20,413 MiB` -> **`3,257 MiB`** (`4,142 MiB` at `-b 2048 -ub 2048`), keeping concurrent prefill locked at `578-588 t/s` with `0` changed-size reallocs.
+
+### 8. Local Server Uplift: Dynamic Decode-Priority Chunked Prefill (`721e555b8`)
+- **Files:** `tools/server/server-context.cpp`.
+- **Problem:** On a single GPU, large `-b 2048 -ub 2048` gives top solo prefill speed (`614 t/s`), but makes a concurrent writing slot pause ~1.7-3.4 s between token bursts while another slot prefills. Lowering `-b` statically slows down solo prefill.
+- **Fix:** Track `decode_prefill_tick` in `server_context_impl`. While any slot is actively generating (`batch.size() > 0`), run 2 pure decode ticks per 1 mixed tick capped to `128` splittable prompt tokens (stays above `n_tokens_banded_min = 32`). When no slot is generating, reset and run full `-b 2048 -ub 2048`.
+- **Verified numbers (`-np 3 -c 600000 --no-kv-unified -b 2048 -ub 2048`):**
+  - Solo 12,026-token prefill: **`614.0 t/s`**, generation **`32.5-37.5 t/s`** (with `dspark_w2_eff`).
+  - Concurrent write (160 tok) + 9,026-token prefill: writing slot stayed at **`11.2 t/s`** (`tg_3s = 10.9-11.8 t/s`, up from `0.08 t/s` unified stall and `5.26 t/s` static `1024`), background prefill averaged **`385.4 t/s`**, `0` changed-size graph reallocs (`36 / 0`).
+- **PR note:** Currently hardcoded (`128` tokens, 2:1 decode-to-prefill ratio); if upstreaming to `llama-server`, expose as CLI flags (e.g. `--prefill-chunk-while-gen` / decode-priority ratio).
+
 ---
 
 ## Current Live Server Configuration
@@ -91,13 +110,12 @@ Separate clean PR 2 worktree: `/Users/tomskeggs/dev/llama.cpp-inkling-pr2` (bran
   -m /Volumes/skeggsdrive/models/unsloth/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q8_K_XL.gguf \
   --alias inkling -ngl 99 -fa on --jinja \
   --host 127.0.0.1 --port 8080 --log-timestamps \
-  -np 5 -c 600000 -kvu --kv-unified-per-slot 200000 \
+  -np 3 -c 600000 --no-kv-unified \
   -ctk q8_0 -ctv q8_0 -ctkd q8_0 -ctvd q8_0 \
-  -b 2048 -ub 1024 --spec-draft-n-ubatch 64 -ctxcp 5 \
+  -b 2048 -ub 2048 --spec-draft-n-ubatch 64 -ctxcp 5 \
   --mmproj /Volumes/skeggsdrive/models/unsloth/Inkling-2-Mini-GGUF/mmproj-F16.gguf \
   -md /Volumes/skeggsdrive/models/unsloth/Inkling-2-Mini-GGUF/dspark-Inkling-2-Mini-Q8_0.gguf \
   --spec-type draft-dspark --spec-draft-p-min 0
 ```
 
-- Footprint on Apple M5 Pro (64 GiB unified, `iogpu.wired_limit_mb = 59392`): `~38.1 / 59.4 GiB` GPU used (`20.8 GiB` headroom).
-- Reminder: if you rebuilt after editing `dspark.cpp` / `misc.metal` at `21:08`, restart the running `llama-server` to pick up the `dspark_w2_eff` + `argmax` uplifts live!
+- Footprint on Apple M5 Pro (64 GiB unified, `iogpu.wired_limit_mb = 59392`): `39.9 / 59.4 GiB` GPU used (**`19.1 GiB` headroom**), 3 isolated `200K` slots + 8 GiB RAM prompt cache (`--cache-ram`) for extra idle conversations.
