@@ -8,8 +8,8 @@
 static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __restrict__ dst, const int64_t ncols) {
     const int64_t row = blockIdx.x;
 
-    float maxval = -FLT_MAX;
-    int   argmax = -1;
+    float maxval = -INFINITY;
+    int   argmax = INT_MAX;
     const float * rowx = x + row * ncols;
 
     for (int32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
@@ -24,7 +24,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
     for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
         const float val = ggml_cuda_shfl_xor(maxval, offset, WARP_SIZE);
         const int   col = ggml_cuda_shfl_xor(argmax, offset, WARP_SIZE);
-        if (val > maxval) {
+        if (val > maxval || (val == maxval && col < argmax)) {
             maxval = val;
             argmax = col;
         }
@@ -45,15 +45,13 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
         __syncthreads();
 
         if (warp_id == 0) {
-            if (lane_id < n_warps) {
-                maxval = shared_maxval[lane_id];
-                argmax = shared_argmax[lane_id];
-            }
+            maxval = lane_id < n_warps ? shared_maxval[lane_id] : -INFINITY;
+            argmax = lane_id < n_warps ? shared_argmax[lane_id] : INT_MAX;
 #pragma unroll
             for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
                 const float val = ggml_cuda_shfl_xor(maxval, offset, WARP_SIZE);
                 const int   col = ggml_cuda_shfl_xor(argmax, offset, WARP_SIZE);
-                if (val > maxval) {
+                if (val > maxval || (val == maxval && col < argmax)) {
                     maxval = val;
                     argmax = col;
                 }
@@ -62,7 +60,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
     }
 
     if (warp_id == 0 && lane_id == 0) {
-        dst[row] = argmax;
+        dst[row] = argmax == INT_MAX ? 0 : argmax;
     }
 }
 

@@ -13,7 +13,7 @@ kernel void kernel_argmax_f32(
     device const float * x_row = (device const float *) ((device const char *) src0 + tgpig * args.nb01);
 
     float   lmax = -INFINITY;
-    int32_t larg = -1;
+    int32_t larg = INT_MAX;
 
     for (int i00 = tpitg; i00 < args.ne00; i00 += ntg) {
         if (x_row[i00] > lmax) {
@@ -22,9 +22,9 @@ kernel void kernel_argmax_f32(
         }
     }
 
-    // find the argmax value in the block
-    float max_val = simd_max(lmax);
-    int32_t arg_val = simd_max(select(-1, larg, lmax == max_val));
+    // find the argmax value in the block (first index wins ties)
+    float   max_val = simd_max(lmax);
+    int32_t arg_val = simd_min(select(INT_MAX, larg, lmax == max_val));
 
     device int32_t * dst_i32 = (device int32_t *) dst;
 
@@ -34,7 +34,7 @@ kernel void kernel_argmax_f32(
     if (ntg > N_SIMDWIDTH) {
         if (sgitg == 0) {
             shared_maxval[tiisg] = -INFINITY;
-            shared_argmax[tiisg] = -1;
+            shared_argmax[tiisg] = INT_MAX;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -49,15 +49,15 @@ kernel void kernel_argmax_f32(
         max_val = shared_maxval[tiisg];
         arg_val = shared_argmax[tiisg];
 
-        float max_val_reduced   = simd_max(max_val);
-        int32_t arg_val_reduced = simd_max(select(-1, arg_val, max_val == max_val_reduced));
+        float   max_val_reduced = simd_max(max_val);
+        int32_t arg_val_reduced = simd_min(select(INT_MAX, arg_val, max_val == max_val_reduced));
 
-        dst_i32[tgpig] = arg_val_reduced;
+        dst_i32[tgpig] = arg_val_reduced == INT_MAX ? 0 : arg_val_reduced;
 
         return;
     }
 
-    dst_i32[tgpig] = arg_val;
+    dst_i32[tgpig] = arg_val == INT_MAX ? 0 : arg_val;
 }
 
 kernel void kernel_argmax_part_f32(
@@ -81,7 +81,7 @@ kernel void kernel_argmax_part_f32(
     device const float * x_row = (device const float *) ((device const char *) src0 + row * args.nb01);
 
     float   lmax = -INFINITY;
-    int32_t larg = -1;
+    int32_t larg = INT_MAX;
 
     for (int i00 = start + tpitg.x; i00 < end; i00 += ntg.x) {
         if (x_row[i00] > lmax) {
@@ -90,9 +90,9 @@ kernel void kernel_argmax_part_f32(
         }
     }
 
-    // find the argmax value in the block
-    float max_val = simd_max(lmax);
-    int32_t arg_val = simd_max(select(-1, larg, lmax == max_val));
+    // find the argmax value in the block (first index wins ties)
+    float   max_val = simd_max(lmax);
+    int32_t arg_val = simd_min(select(INT_MAX, larg, lmax == max_val));
 
     threadgroup   float * shared_maxval = (threadgroup   float *) shmem;
     threadgroup int32_t * shared_argmax = (threadgroup int32_t *) shmem + N_SIMDWIDTH;
@@ -100,7 +100,7 @@ kernel void kernel_argmax_part_f32(
     if (ntg.x > N_SIMDWIDTH) {
         if (sgitg == 0) {
             shared_maxval[tiisg] = -INFINITY;
-            shared_argmax[tiisg] = -1;
+            shared_argmax[tiisg] = INT_MAX;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -115,8 +115,8 @@ kernel void kernel_argmax_part_f32(
         max_val = shared_maxval[tiisg];
         arg_val = shared_argmax[tiisg];
 
-        float max_val_reduced   = simd_max(max_val);
-        int32_t arg_val_reduced = simd_max(select(-1, arg_val, max_val == max_val_reduced));
+        float   max_val_reduced = simd_max(max_val);
+        int32_t arg_val_reduced = simd_min(select(INT_MAX, arg_val, max_val == max_val_reduced));
 
         max_val = max_val_reduced;
         arg_val = arg_val_reduced;
@@ -148,18 +148,20 @@ kernel void kernel_argmax_final_f32(
     device const int32_t * tmp_arg = (device const int32_t *) tmp + npart * (int) args.ne01;
 
     float   lmax = -INFINITY;
-    int32_t larg = -1;
+    int32_t larg = INT_MAX;
 
     for (int i = tpitg.x; i < npart; i += ntg.x) {
-        if (tmp_max[row*npart + i] > lmax) {
-            lmax = tmp_max[row*npart + i];
-            larg = tmp_arg[row*npart + i];
+        const float   v = tmp_max[row*npart + i];
+        const int32_t a = tmp_arg[row*npart + i];
+        if (v > lmax || (v == lmax && a < larg)) {
+            lmax = v;
+            larg = a;
         }
     }
 
-    // find the argmax value in the block
-    float max_val = simd_max(lmax);
-    int32_t arg_val = simd_max(select(-1, larg, lmax == max_val));
+    // find the argmax value in the block (first index wins ties)
+    float   max_val = simd_max(lmax);
+    int32_t arg_val = simd_min(select(INT_MAX, larg, lmax == max_val));
 
     threadgroup   float * shared_maxval = (threadgroup   float *) shmem;
     threadgroup int32_t * shared_argmax = (threadgroup int32_t *) shmem + N_SIMDWIDTH;
@@ -167,7 +169,7 @@ kernel void kernel_argmax_final_f32(
     if (ntg.x > N_SIMDWIDTH) {
         if (sgitg == 0) {
             shared_maxval[tiisg] = -INFINITY;
-            shared_argmax[tiisg] = -1;
+            shared_argmax[tiisg] = INT_MAX;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -182,15 +184,15 @@ kernel void kernel_argmax_final_f32(
         max_val = shared_maxval[tiisg];
         arg_val = shared_argmax[tiisg];
 
-        float max_val_reduced   = simd_max(max_val);
-        int32_t arg_val_reduced = simd_max(select(-1, arg_val, max_val == max_val_reduced));
+        float   max_val_reduced = simd_max(max_val);
+        int32_t arg_val_reduced = simd_min(select(INT_MAX, arg_val, max_val == max_val_reduced));
 
         max_val = max_val_reduced;
         arg_val = arg_val_reduced;
     }
 
     if (tpitg.x == 0) {
-        ((device int32_t *) dst)[row] = arg_val;
+        ((device int32_t *) dst)[row] = arg_val == INT_MAX ? 0 : arg_val;
     }
 }
 

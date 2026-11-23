@@ -3119,14 +3119,16 @@ struct test_rms_norm_mul_rope : public test_case {
 struct test_argmax : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
+    const bool ties;
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, ties);
     }
 
     test_argmax(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 100, 1, 1})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 100, 1, 1},
+            bool ties = false)
+        : type(type), ne(ne), ties(ties) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -3143,14 +3145,27 @@ struct test_argmax : public test_case {
         std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_F32) {
-                // initialize with unique values to avoid ties
-                for (int64_t r = 0; r < ggml_nrows(t); r++) {
-                    std::vector<float> data(t->ne[0]);
-                    for (int i = 0; i < t->ne[0]; i++) {
-                        data[i] = i;
+                if (ties) {
+                    // repeated maxima across threads and partitions; first index must win
+                    for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                        std::vector<float> data(t->ne[0], -1.0f);
+                        const int64_t first = (r * 37) % t->ne[0];
+                        for (int64_t i = first; i < t->ne[0]; i += std::max<int64_t>(1, t->ne[0] / 7)) {
+                            data[i] = 42.0f;
+                        }
+                        data[t->ne[0] - 1] = 42.0f;
+                        ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
                     }
-                    std::shuffle(data.begin(), data.end(), rng);
-                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+                } else {
+                    // initialize with unique values to avoid ties
+                    for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                        std::vector<float> data(t->ne[0]);
+                        for (int i = 0; i < t->ne[0]; i++) {
+                            data[i] = i;
+                        }
+                        std::shuffle(data.begin(), data.end(), rng);
+                        ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+                    }
                 }
             } else {
                 init_tensor_uniform(t);
@@ -11654,6 +11669,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 12, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {2000, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {5438,  3, 1, 1}));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024,  8, 1, 1}, true));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {10000, 8, 1, 1}, true));
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));
