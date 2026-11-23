@@ -18,6 +18,7 @@ Separate clean PR 2 worktree: `/Users/tomskeggs/dev/llama.cpp-inkling-pr2` (bran
 | `8ad8d90f0` | DSpark (DSpark uplift #2) | Follow-up PR (`unslothai/llama.cpp`) | Precompute `dspark_w2_eff = target.output @ dspark_hidden_out`, simplify Markov chain argmax & unpadded vocab slicing |
 | `bc05d21ce` | Banded FA + non-unified KV | Follow-up PR (`unslothai/llama.cpp`) | Reserve banded FA graph for multi-stream non-unified KV (`n_stream > 1`), dropping `3x200K` compute reserve from `20.4 GiB` -> `3.26 GiB` |
 | `721e555b8` | Server scheduling | Optional PR / local tuning | Dynamic decode-priority chunked prefill (2 pure decode ticks per `128`-token prefill chunk while any slot writes; full `-b/-ub` when solo) |
+| `117ef8c36` | DSpark (DSpark uplift #3) | Follow-up PR (`unslothai/llama.cpp`) | Prune Inkling2 greedy Markov head and LM-head projection to only `1..n_draft` output slots (+ partial-output graph reuse guard) |
 
 ---
 
@@ -99,6 +100,15 @@ Separate clean PR 2 worktree: `/Users/tomskeggs/dev/llama.cpp-inkling-pr2` (bran
   - Solo 12,026-token prefill: **`614.0 t/s`**, generation **`32.5-37.5 t/s`** (with `dspark_w2_eff`).
   - Concurrent write (160 tok) + 9,026-token prefill: writing slot stayed at **`11.2 t/s`** (`tg_3s = 10.9-11.8 t/s`, up from `0.08 t/s` unified stall and `5.26 t/s` static `1024`), background prefill averaged **`385.4 t/s`**, `0` changed-size graph reallocs (`36 / 0`).
 - **PR note:** Currently hardcoded (`128` tokens, 2:1 decode-to-prefill ratio); if upstreaming to `llama-server`, expose as CLI flags (e.g. `--prefill-chunk-while-gen` / decode-priority ratio).
+
+### 9. PR 9 Candidate (DSpark Uplift #3): Prune Greedy Markov Loop & LM Head to `1..n_draft` (`117ef8c36`)
+- **Files:** `common/speculative.cpp`, `src/llama-graph.h`, `src/models/dspark.cpp`.
+- **Problem:** In greedy Inkling-2 DSpark (`block_size = 8`, `n_draft = 3`), the draft graph still projected slot `0` and ran the Markov head across all `block - 1 = 7` slots even though speculative decoding only consumes draft slots `1..n_draft`.
+- **Fix:**
+  - `common/speculative.cpp`: in greedy Inkling-2 RNN mode (`!sample_rnn`), mark only positions `1..n_draft` as `output = true` in the draft batch.
+  - `src/llama-graph.h`: extend `llm_graph_params::allow_reuse` to compare `ubatch.output[]` for partial-output graphs (`n_outputs > 0 && n_outputs < ubatch.n_tokens`) so graphs with different `n_draft` prefixes never alias.
+  - `src/models/dspark.cpp`: detect a uniform `1..n_draft` output prefix across all blocks in `graph_inkling2`, slice `cur` to just those `n_draft` rows before `target.output` projection, and run the Markov head loop for only `n_draft` steps instead of `block - 1`.
+- **PR prep note:** Pairs naturally with DSpark uplifts #1 (`a77861652`) and #2 (`8ad8d90f0`). Note: rebuild & restart `llama-server` to pick up `117ef8c36` live.
 
 ---
 
