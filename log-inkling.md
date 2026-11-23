@@ -19,6 +19,7 @@ Separate clean PR 2 worktree: `/Users/tomskeggs/dev/llama.cpp-inkling-pr2` (bran
 | `bc05d21ce` | Banded FA + non-unified KV | Follow-up PR (`unslothai/llama.cpp`) | Reserve banded FA graph for multi-stream non-unified KV (`n_stream > 1`), dropping `3x200K` compute reserve from `20.4 GiB` -> `3.26 GiB` |
 | `721e555b8` | Server scheduling | Optional PR / local tuning | Dynamic decode-priority chunked prefill (2 pure decode ticks per `128`-token prefill chunk while any slot writes; full `-b/-ub` when solo) |
 | `117ef8c36` | DSpark (DSpark uplift #3) | Follow-up PR (`unslothai/llama.cpp`) | Prune Inkling2 greedy Markov head and LM-head projection to only `1..n_draft` output slots (+ partial-output graph reuse guard) |
+| `d9a9c5140` | DSpark (DSpark uplift #4) | Follow-up PR (`unslothai/llama.cpp`) | Enable `dev_features`, backend greedy sampling (with zero raw-logit copy fix), fused `mix()`, hoisted `dspark_joint_proj`, and probabilistic `sample_rnn` cleanup |
 
 ---
 
@@ -109,6 +110,19 @@ Separate clean PR 2 worktree: `/Users/tomskeggs/dev/llama.cpp-inkling-pr2` (bran
   - `src/llama-graph.h`: extend `llm_graph_params::allow_reuse` to compare `ubatch.output[]` for partial-output graphs (`n_outputs > 0 && n_outputs < ubatch.n_tokens`) so graphs with different `n_draft` prefixes never alias.
   - `src/models/dspark.cpp`: detect a uniform `1..n_draft` output prefix across all blocks in `graph_inkling2`, slice `cur` to just those `n_draft` rows before `target.output` projection, and run the Markov head loop for only `n_draft` steps instead of `block - 1`.
 - **PR prep note:** Pairs naturally with DSpark uplifts #1 (`a77861652`) and #2 (`8ad8d90f0`). Note: rebuild & restart `llama-server` to pick up `117ef8c36` live.
+
+### 10. PR 10 Candidate (DSpark Uplift #4): Device Features, Backend Greedy, Fused Mix & Hoisted Joint Proj (`d9a9c5140`)
+- **Files:** `common/speculative.cpp`, `src/llama-context.h`, `src/llama-context.cpp`, `src/llama-graph.h`, `src/llama-graph.cpp`, `src/models/dspark.cpp`.
+- **Changes:**
+  - Re-enabled `dev_features = true` (`layer_inp_dev`) for Inkling-2 DSpark and skipped `store_context_features()` on prefill chunks outside the trailing `block_size` window.
+  - Enabled backend greedy sampling (`llama_sampler_init_greedy()`) per sequence on `ctx_dft` in greedy mode, plus fixed `llm_graph_context::build_sampling()` to skip copying unmodified full-vocab `logits_seq` when a terminal backend sampler already produced `data.sampled` (avoids 2.4-12 MB GPU->CPU raw logit copies per draft round).
+  - Hoisted & fused the per-layer KV injection `mix()` in `graph_inkling2` into a single `ggml_soft_max` + `ggml_cont(permute)` + 2D `ggml_mul_mat`.
+  - Pre-split `dspark_joint_proj` into contiguous F16 `dspark_jp_{dyn,hid,ctx}` (+7.50 MiB, extracted via `ggml_mul_mat` with identity slices for full `CPU_REPACK` & quant compatibility) and hoisted static `hidden`/`context` projections out of the Markov loop.
+  - Cleaned up probabilistic `sample_rnn` / `llama_draft_step` (single-pass max+argmax, `inv_temp`/`inv_sum`, reused buffers).
+- **Verified numbers (M5 Pro, Inkling-2-Mini-UD-Q8_K_XL + `dspark-Inkling-2-Mini-Q8_0`, `-np 5 -c 600000 -kvu`):**
+  - Synthetic `test_dspark` passes all 6 configs (CPU/Metal x F16/Q8_0 x small/40k vocab, `0` token mismatches, `0.0` capped & `dev_features` diffs).
+  - Bit-for-bit identical greedy server outputs vs `#1+#2+#8`: 3.5K prompt eval `6006.2 -> 5636.2 ms` (`589.6 -> 628.3 t/s`, `-370 ms`), single-seq draft `8.13 -> 7.36-7.75 ms/call`, 4x concurrent `49.04 t/s` aggregate with draft `10.34 ms/batch` (`2.97 ms/seq`).
+  - Live 115K-context session: draft `14.08 ms/call` (~9.4% of verify step time), `mean acc len = 2.61`.
 
 ---
 
