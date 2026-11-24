@@ -5610,6 +5610,13 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect(simple_assist_msg("Hello, world!\nWhat's up?", "No tool needed"))
             .run();
 
+        // Tools given, but the model emits an undeclared tool name after the header (must not trigger lazy grammar)
+        tst.test(P + "<|content_thinking|>Thinking" + E + H + "sheets<|content_invoke_tool_json|>{\"name\":\"sheets\",\"args\":{}}" + E)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(simple_assist_msg("", "Thinking"))
+            .run();
+
         // Parallel tool calls, one block each
         tst.test(P + CALL + H +
                  "special_function_with_opt<|content_invoke_tool_json|>{\"name\":\"special_function_with_opt\",\"args\":{\"arg1\":1,\"arg2\":2}}" + E)

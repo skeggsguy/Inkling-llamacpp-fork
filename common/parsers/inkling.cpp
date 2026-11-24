@@ -149,14 +149,23 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
         });
 
         if (data.grammar_lazy) {
-            // a header followed by text and not by a content token is a tool call, the grammar starts at the name
-            data.grammar_triggers = {
-                { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, "<\\|message_model\\|>([^<])" },
-            };
-            // Inkling 1: the first header is in the generation prompt, and a lazy grammar does not get the prompt.
-            // an output that starts with no content token is a tool call. not for a continuation, it starts with text
-            if (!inputs.has_continuation()) {
-                data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL, "[^<]+" });
+            // match only declared tool names through TOOL_JSON so an undeclared name or missing content tag cannot crash the grammar
+            std::string names;
+            foreach_function(inputs.tools, [&](size_t, const json & tool) {
+                if (!names.empty()) {
+                    names += "|";
+                }
+                names += regex_escape(tool.at("function").at("name"));
+            });
+            if (!names.empty()) {
+                const std::string call_prefix = "(?:" + names + ")" + regex_escape(TOOL_JSON);
+                data.grammar_triggers = {
+                    { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, regex_escape(HEADER) + "(" + call_prefix + ")" },
+                };
+                // Inkling 1: the first header is in the generation prompt, and a lazy grammar does not get the prompt
+                if (!inputs.has_continuation()) {
+                    data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL, call_prefix });
+                }
             }
         }
     }
