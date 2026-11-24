@@ -126,9 +126,21 @@ struct server_slot_plan {
 struct server_slot_sched {
     float slot_prompt_similarity = 0.0f;
 
+    // the utility lane (server-utility-lane.h), -1 when off: only a task asking for it by id gets it, and it keeps
+    // its memory, so the prompt cache never saves, loads or clears it
+    int id_slot_reserved = -1;
+
     // idle slots that lose the least by being reused: empty slots first, then the least recently used ones
+    // the utility lane is never one of them
     std::vector<int> get_free_slots(const std::vector<server_slot_info> & slots, size_t n_slots_needed, int exclude_id_slot) const;
 
     // lora: the lora config of the task
     server_slot_plan select(const std::vector<server_slot_info> & slots, const server_task & task, const std::vector<common_adapter_lora_info> & lora) const;
+
+    // idle slots to save to the prompt cache (and clear, with a unified KV cache) when a task starts: all but the
+    // utility lane
+    std::vector<int> get_idle_slots_to_cache(const std::vector<server_slot_info> & slots) const;
+
+    // the idle slot to clear when the KV cache is full: the first one holding tokens, never the utility lane; -1 if none
+    int get_idle_slot_to_purge(const std::vector<server_slot_info> & slots) const;
 };

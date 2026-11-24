@@ -298,10 +298,10 @@ void server_prompt_cache::update() {
 // server_slot_sched
 //
 
-static std::vector<const server_slot_info *> get_free_slot_infos(const std::vector<server_slot_info> & slots, size_t n_slots_needed, int exclude_id_slot) {
+static std::vector<const server_slot_info *> get_free_slot_infos(const std::vector<server_slot_info> & slots, size_t n_slots_needed, int exclude_id_slot, int id_slot_reserved) {
     std::vector<const server_slot_info *> free_slots;
     for (const auto & slot : slots) {
-        if (!slot.is_processing && slot.id != exclude_id_slot) {
+        if (!slot.is_processing && slot.id != exclude_id_slot && slot.id != id_slot_reserved) {
             free_slots.push_back(&slot);
         }
     }
@@ -320,7 +320,7 @@ static std::vector<const server_slot_info *> get_free_slot_infos(const std::vect
 
 std::vector<int> server_slot_sched::get_free_slots(const std::vector<server_slot_info> & slots, size_t n_slots_needed, int exclude_id_slot) const {
     std::vector<int> res;
-    for (const auto * slot : get_free_slot_infos(slots, n_slots_needed, exclude_id_slot)) {
+    for (const auto * slot : get_free_slot_infos(slots, n_slots_needed, exclude_id_slot, id_slot_reserved)) {
         res.push_back(slot->id);
     }
 
@@ -360,6 +360,11 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
 
         for (const auto & slot : slots) {
             if (task.id_slot != -1 && slot.id != task.id_slot) {
+                continue;
+            }
+
+            // the utility lane is only for the tasks that ask for it
+            if (task.id_slot == -1 && slot.id == id_slot_reserved) {
                 continue;
             }
 
@@ -414,7 +419,7 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
 
     // find an empty slot, or the one that has been least recently used
     if (ret == nullptr) {
-        const auto free_slots = get_free_slot_infos(slots, 1, -1);
+        const auto free_slots = get_free_slot_infos(slots, 1, -1, id_slot_reserved);
 
         if (!free_slots.empty()) {
             ret = free_slots[0];
@@ -429,8 +434,29 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
         return {};
     }
 
-    // cache prompts only for the tasks that reuse them
-    update_cache = update_cache && !task.is_stateless();
+    // cache prompts only for the tasks that reuse them; the utility lane keeps its memory and never touches the cache
+    update_cache = update_cache && !task.is_stateless() && ret->id != id_slot_reserved;
 
     return { ret->id, update_cache };
+}
+
+std::vector<int> server_slot_sched::get_idle_slots_to_cache(const std::vector<server_slot_info> & slots) const {
+    std::vector<int> res;
+    for (const auto & slot : slots) {
+        if (!slot.is_processing && slot.id != id_slot_reserved) {
+            res.push_back(slot.id);
+        }
+    }
+
+    return res;
+}
+
+int server_slot_sched::get_idle_slot_to_purge(const std::vector<server_slot_info> & slots) const {
+    for (const auto & slot : slots) {
+        if (!slot.is_processing && slot.id != id_slot_reserved && slot.prompt->n_tokens() > 0) {
+            return slot.id;
+        }
+    }
+
+    return -1;
 }

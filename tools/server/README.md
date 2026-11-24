@@ -165,6 +165,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-lcs, --lookup-cache-static FNAME` | path to static lookup cache to use for lookup decoding (not updated by generation) |
 | `-lcd, --lookup-cache-dynamic FNAME` | path to dynamic lookup cache to use for lookup decoding (updated by generation) |
 | `--kv-unified-per-slot N` | context limit per parallel slot (default: unset, behavior unchanged).<br/>when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N<br/>(env: LLAMA_ARG_KV_UNIFIED_PER_SLOT) |
+| `--utility-lane N` | keep the last slot for requests with the header 'X-Lane: utility' and cap it at N tokens; other requests<br/>never use it, it keeps its own memory and is never saved to the prompt cache (default: 0 = off).<br/>needs -np 2 or more, and N no larger than a slot's context<br/>(env: LLAMA_ARG_UTILITY_LANE) |
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, 0 for decision models, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
@@ -418,6 +419,25 @@ Related flags: `--cors-origins`, `--cors-methods`, `--cors-headers`, `--cors-cre
 ### Running behind a proxy
 
 If your host reaches the internet through a corporate proxy, export `HTTP_PROXY` and `HTTPS_PROXY` before running commands that download models (e.g. `export HTTPS_PROXY=http://proxy.example.com:8080`). Hosts listed in `NO_PROXY` and loopback addresses are contacted directly.
+
+### Utility lane
+
+`--utility-lane N` keeps the last slot (`n_parallel - 1`) for short background jobs, such as chat titles or memory notes, so they never take over a slot that holds someone's conversation. The other slots stay for everything else.
+
+- Only a request with the header `X-Lane: utility` goes to the utility lane. Its name and value are matched ignoring case and surrounding spaces. A request without it never lands there, even when that slot is the only one idle.
+- The utility lane holds at most `N` tokens, and a longer request gets the usual "exceeds the available context size" error. The other slots keep their own limit.
+- When the utility lane is busy, the next utility request waits for it, and people's requests are not held up behind it.
+- The utility lane keeps its own memory between jobs. It is never saved to the prompt cache (`--cache-ram`), never loaded from it, and never cleared when a new task starts (`--cache-idle-slots`).
+- The server refuses to start if `-np` is below 2, or if `N` is larger than a slot's context.
+
+```sh
+# 3 slots for people at 200K each + 1 utility lane at 50K, in one 650K shared pool
+llama-server -m model.gguf -np 4 -c 650000 -kvu --kv-unified-per-slot 200000 --utility-lane 50000
+curl http://127.0.0.1:8080/v1/chat/completions -H 'X-Lane: utility' -H 'Content-Type: application/json' \
+    -d '{"messages": [{"role": "user", "content": "A three-word title for: ..."}]}'
+```
+
+At start-up the server logs `utility lane: slot 3, 50000 tokens, header X-Lane: utility`.
 
 ## Build
 

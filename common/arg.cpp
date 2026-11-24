@@ -1638,6 +1638,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED_PER_SLOT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        { "--utility-lane" }, "N",
+        "keep the last slot for requests with the header 'X-Lane: utility' and cap it at N tokens; other requests\n"
+        "never use it, it keeps its own memory and is never saved to the prompt cache (default: 0 = off).\n"
+        "needs -np 2 or more, and N no larger than a slot's context",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--utility-lane must be 0 (off) or a number of tokens");
+            }
+            params.utility_lane = value;
+        }
+    ).set_env("LLAMA_ARG_UTILITY_LANE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION

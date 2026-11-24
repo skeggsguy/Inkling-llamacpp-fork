@@ -1,5 +1,6 @@
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-utility-lane.h"
 
 #include "log.h"
 
@@ -90,22 +91,18 @@ int server_queue::get_new_id() {
 void server_queue::pop_deferred_task(int id_slot) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     if (!queue_tasks_deferred.empty()) {
-        // try to find a task that uses the specified slot
-        bool found = false;
-        for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
-            if (it->id_slot == id_slot) {
-                QUE_DBG("pop deferred task (use slot %d), id_task = %d\n", id_slot, it->id);
-                queue_tasks.emplace_front(std::move(*it));
-                queue_tasks_deferred.erase(it);
-                found = true;
-                break;
-            }
+        // a task that uses the specified slot first, then the first deferred task (default behavior);
+        // with a utility lane, people and utility tasks each wait for their own lanes
+        std::vector<int> id_slots;
+        for (const auto & task : queue_tasks_deferred) {
+            id_slots.push_back(task.id_slot);
         }
-        // if not tasks found using the slot, just pop the first deferred task (default behavior)
-        if (!found) {
-            QUE_DBG("pop deferred task, id_task = %d\n", queue_tasks_deferred.front().id);
-            queue_tasks.emplace_front(std::move(queue_tasks_deferred.front()));
-            queue_tasks_deferred.pop_front();
+        const int i = server_deferred_pick(id_slots, id_slot, id_slot_utility);
+        if (i >= 0) {
+            auto it = queue_tasks_deferred.begin() + i;
+            QUE_DBG("pop deferred task (slot %d released, task asks for slot %d), id_task = %d\n", id_slot, it->id_slot, it->id);
+            queue_tasks.emplace_front(std::move(*it));
+            queue_tasks_deferred.erase(it);
         }
     }
     time_last_task = ggml_time_ms();

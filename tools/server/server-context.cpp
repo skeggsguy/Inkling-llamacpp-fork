@@ -12,6 +12,7 @@
 #include "server-schema.h"
 #include "server-slot-sched.h"
 #include "server-stream.h"
+#include "server-utility-lane.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -1498,6 +1499,23 @@ private:
             }
         }
 
+        // the utility lane (server-utility-lane.h): the last slot, kept for requests with X-Lane: utility
+        {
+            const std::string refusal = server_utility_refusal(params_base.n_parallel, n_ctx_slot(), params_base.utility_lane);
+            if (!refusal.empty()) {
+                SRV_ERR("%s\n", refusal.c_str());
+                return false;
+            }
+
+            slot_sched.id_slot_reserved = server_utility_slot(params_base.n_parallel, params_base.utility_lane);
+            queue_tasks.set_utility_slot(slot_sched.id_slot_reserved);
+
+            if (slot_sched.id_slot_reserved >= 0) {
+                SRV_INF("utility lane: slot %d, %d tokens, header %s: %s\n", slot_sched.id_slot_reserved,
+                        params_base.utility_lane, SERVER_UTILITY_HEADER, SERVER_UTILITY_VALUE);
+            }
+        }
+
         slots.clear();
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
@@ -1555,7 +1573,7 @@ private:
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
-            slot.n_ctx   = n_ctx_slot();
+            slot.n_ctx   = slot.id == slot_sched.id_slot_reserved ? params_base.utility_lane : n_ctx_slot();
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -1867,21 +1885,16 @@ private:
             return res;
         }
 
-        for (auto & slot : slots) {
-            if (slot.is_processing()) {
-                continue;
-            }
+        // clear slots one by one, never the utility lane
+        const int id_slot = slot_sched.get_idle_slot_to_purge(get_slot_infos());
+        if (id_slot != -1) {
+            server_slot & slot = *get_slot_by_id(id_slot);
 
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+            SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
-                slot.prompt_clear();
+            slot.prompt_clear();
 
-                res = true;
-
-                // clear slots one by one
-                break;
-            }
+            res = true;
         }
 
         return res;
@@ -3037,19 +3050,20 @@ private:
                     }
 
                     if (params_base.cache_idle_slots) {
-                        for (auto & slot : slots) {
-                            if (!slot.is_processing()) {
-                                SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+                        // every idle slot but the utility lane, which keeps its memory
+                        for (int id_idle : slot_sched.get_idle_slots_to_cache(get_slot_infos())) {
+                            server_slot & slot = *get_slot_by_id(id_idle);
 
-                                if (slot.prompt_save(*prompt_cache)) {
-                                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                    prompt_cache->update();
-                                }
+                            SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (params_base.kv_unified) {
-                                    // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear();
-                                }
+                            if (slot.prompt_save(*prompt_cache)) {
+                                SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+                                prompt_cache->update();
+                            }
+
+                            if (params_base.kv_unified) {
+                                // [TAG_IDLE_SLOT_CLEAR]
+                                slot.prompt_clear();
                             }
                         }
                     }
@@ -5348,6 +5362,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
 
+        const int id_slot_utility = server_utility_slot(params.n_parallel, params.utility_lane);
+
         for (size_t i = 0; i < inputs.size(); i++) {
             server_task task = server_task(type);
 
@@ -5363,6 +5379,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.apply_chat_session(chat_session);
 
             task.id_slot = json_value(data, "id_slot", -1);
+
+            // X-Lane: utility puts the request on the utility lane, which it waits for when busy (server-utility-lane.h)
+            if (id_slot_utility >= 0 && server_is_utility(req.headers)) {
+                task.id_slot = id_slot_utility;
+            }
+
             sse_ping_interval = task.params.sse_ping_interval;
 
             // OAI-compat

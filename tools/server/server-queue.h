@@ -20,6 +20,7 @@ private:
     bool req_stop_sleeping = false;
     int64_t time_last_task = 0;
     int n_inflight = 0; // requests that keep the server awake, see wait_until_no_sleep()
+    int id_slot_utility = -1; // the utility lane, -1 when off (server-utility-lane.h)
 
     // queues
     std::deque<server_task> queue_tasks;
@@ -64,6 +65,7 @@ public:
 
     // Call when the state of one slot is changed, it will move one task from deferred to main queue
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
+    // with a utility lane, server_deferred_pick() decides (server-utility-lane.h)
     void pop_deferred_task(int id_slot);
 
     // if sleeping, request exiting sleep state and wait until it is done
@@ -117,6 +119,11 @@ public:
     //
     // Functions below are not thread-safe, must only be used before start_loop() is called
     //
+
+    // the utility lane's slot, for pop_deferred_task(); -1 (the default) is off
+    void set_utility_slot(int id_slot) {
+        id_slot_utility = id_slot;
+    }
 
     // Register function to process a new task
     // the second argument tells whether the queue is currently yielding (see yield_to_queue)
