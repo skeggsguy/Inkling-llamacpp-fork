@@ -22,6 +22,7 @@ Separate clean PR 2 worktree: `/Users/tomskeggs/dev/llama.cpp-inkling-pr2` (bran
 | `d9a9c5140` | DSpark (DSpark uplift #4) | Follow-up PR (`unslothai/llama.cpp`) | Enable `dev_features`, backend greedy sampling (with zero raw-logit copy fix), fused `mix()`, hoisted `dspark_joint_proj`, and probabilistic `sample_rnn` cleanup |
 | `14cd30131` | Metal banded `fa_vec` + `kv_rows` | Follow-up PR (`unslothai/llama.cpp`) | Add `FLASH_ATTN_EXT_BANDED` + `kv_rows` to Metal `fa_vec`, right-aligned position-ordered `kv_rows` for fragmented `-kvu` and concurrent multi-slot decode |
 | `d58ad28ca` | Inkling chat parser | Standalone PR (`ggml-org` / `unslothai`) | Restrict Inkling lazy grammar triggers to declared tool names through `<|content_invoke_tool_json|>` to prevent empty-grammar-stack crashes |
+| `66a318c0b` | Server scheduling (utility lane) | Local (`inkling-daily`) | `--utility-lane N`: the last slot kept for `X-Lane: utility` requests, capped at `N` tokens, keeps its own memory and never enters the RAM prompt cache |
 
 ---
 
@@ -146,22 +147,42 @@ Separate clean PR 2 worktree: `/Users/tomskeggs/dev/llama.cpp-inkling-pr2` (bran
 - **Fix:** Match only escaped declared tool names followed by `<|content_invoke_tool_json|>` (`<\|message_model\|>((?:tool1|tool2|...)<\|content_invoke_tool_json\|>)` plus `PATTERN_FULL` for Inkling 1), and added a regression test in `tests/test-chat.cpp`.
 - **Verified:** `./build/bin/test-chat` (`[chat] All tests passed!`).
 
+### 13. Local: Utility Lane `--utility-lane N` (`66a318c0b`)
+- **Files:** `common/{arg.cpp,common.h}`, `tools/server/{server-utility-lane.*,server-slot-sched.*,server-queue.*,server-context.cpp,CMakeLists.txt,README.md}`, `tests/{CMakeLists.txt,test-server-utility-lane.cpp,test-server-utility-lane-queue.cpp}`.
+- **Problem:** Utility calls (chat titles, naming, memory capture) floated across the `-np 5` slots, so a short title call could take a person's slot. Pinning by `"id_slot"` needs caller code OpenCode can't send. And under `-kvu` every new request saves each idle slot to the RAM prompt cache and clears it (`cache_idle_slots`, `[TAG_IDLE_SLOT_CLEAR]`), so a pinned slot would lose its memory anyway.
+- **Fix:**
+  - `--utility-lane N` (env `LLAMA_ARG_UTILITY_LANE`, default `0` = off) keeps slot `n_parallel - 1` for requests with the header `X-Lane: utility` (name and value ignoring case and surrounding spaces) and caps it at `N` tokens, so a longer request gets the usual `exceed_context_size_error`. Refuses to start with `-np < 2` or `N` above a slot's context.
+  - The request handler sets `task.id_slot` to the lane, so a busy lane defers the task (one utility job at a time). `server_slot_sched::select()` and `get_free_slots()` never hand the lane to a task without `id_slot`; `pop_deferred_task()` moves the oldest slot-less task when a people slot frees.
+  - The lane keeps its memory: no `update_cache`, skipped by the idle save-and-clear loop and by `try_clear_idle_slots()`.
+  - One start-up line: `utility lane: slot 3, 50000 tokens, header X-Lane: utility`.
+- **Verified numbers (M5 Pro, daily launcher `-np 4 -c 650000 -kvu --kv-unified-per-slot 200000 --utility-lane 50000`, DSpark, opened by the study's library agent):**
+  - Model-free `test-server-utility-lane` (header cases, refusals, 2,000 generated slot states, 5,000 generated deferred queues) and `test-server-component` pass.
+  - `/slots` `n_ctx`: `[200000, 200000, 200000, 50000]`.
+  - Utility requests land on slot 3 (`selected slot by id (3)`); 4 people requests at once ran on slots 0-2 and the 4th waited for a free slot, never slot 3; 2 utility requests ran one after the other.
+  - A `60,011`-token utility request: HTTP 400 `exceed_context_size_error` (`n_ctx 50000`); a people request after it answered.
+  - Memory kept: a second utility request sharing a `4,816`-token opening reused `cache_n = 3796` (up to the last checkpoint); `saving idle slot to prompt cache` only ever named slots 0-2.
+  - GPU total `40,129 MiB` (`39.19 GiB`, `-lv 4` buffer lines incl. mmproj `609.71 MiB`): target KV `10,795 + 425 MiB`, compute `5,189 MiB`, draft KV `1,349 + 18 MiB`. ioreg "Alloc system memory" `39.27-39.29 GiB` vs `38.00 GiB` for the old `-np 5 -c 600000` (`+1.29 GiB`). Swap unmoved (`2829.88 MB`) through all checks; an image chat answered.
+  - Not yet shown: `X-Lane: utility` through `/v1/chat/completions` (the checks used `/completion`, same handler).
+- **Note:** At the default log level the buffer sizes and `saving idle slot` (`SLT_TRC`) don't print; use `/slots` or a `-lv 4` probe.
+
 ---
 
 ## Current Live Server Configuration
 
+Since 2026-11-24 the daily server is opened by the study's library agent (`~/dev/ai/runner/serve_inkling.py`, `GGML_METAL_RESIDENCY_KEEP_ALIVE_S=10000000`, default log level), not by hand: `~/dev/ai/runner/library.sh stop` before a hand-run server, `start` after. Its command (3 people slots at 200K + 1 utility slot at 50K, 650K pool, ~39.2 GiB on `MTL0`):
+
 ```sh
 /Users/tomskeggs/dev/llama.cpp-inkling/build/bin/llama-server \
-  -lv 4 \
   -m /Volumes/skeggsdrive/models/unsloth/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q8_K_XL.gguf \
   --alias inkling -ngl 99 -fa on --jinja \
   --host 127.0.0.1 --port 8080 --log-timestamps \
-  -np 5 -c 600000 -kvu --kv-unified-per-slot 200000 \
+  -np 4 -c 650000 -kvu --kv-unified-per-slot 200000 --utility-lane 50000 \
   -ctk q8_0 -ctv q8_0 -ctkd q8_0 -ctvd q8_0 \
   -b 2048 -ub 1024 --spec-draft-n-ubatch 64 -ctxcp 5 \
+  --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --mmproj /Volumes/skeggsdrive/models/unsloth/Inkling-2-Mini-GGUF/mmproj-F16.gguf \
   -md /Volumes/skeggsdrive/models/unsloth/Inkling-2-Mini-GGUF/dspark-Inkling-2-Mini-Q8_0.gguf \
   --spec-type draft-dspark --spec-draft-p-min 0
 ```
 
-- Footprint on Apple M5 Pro (64 GiB unified, `iogpu.wired_limit_mb = 59392`): `MTL0` KV `9.96 + 0.51 GiB` (target) + `1.25 + 0.02 GiB` (draft), `MTL0` compute `4.80 GiB` (target) + `0.12 GiB` (draft), 5 unified slots capped at `200K` each (`-kvu --kv-unified-per-slot 200000`) + 8 GiB RAM prompt cache.
+- Footprint on Apple M5 Pro (64 GiB unified, `iogpu.wired_limit_mb = 59392`): `MTL0` KV `10.54 + 0.42 GiB` (target) + `1.32 + 0.02 GiB` (draft), `MTL0` compute `5.07 GiB` (target) + `0.12 GiB` (draft), 4 unified slots (3 at `200K`, the utility slot at `50K`; `-kvu --kv-unified-per-slot 200000 --utility-lane 50000`) + 8 GiB RAM prompt cache, `40,129 MiB` on `MTL0` in all (see section 13). The old `-np 5 -c 600000` shape was KV `9.96 + 0.51 GiB`, compute `4.80 GiB`.
