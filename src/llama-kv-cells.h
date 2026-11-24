@@ -91,6 +91,7 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+            seq_pos_dups[s] = 0;
             std::fill(seq_bits[s].begin(), seq_bits[s].end(), 0);
         }
     }
@@ -491,6 +492,63 @@ public:
         }
     }
 
+    // verify that every integer position in [p_min, pos_max] appears exactly once in seq_id
+    bool has_unique_pos_span(llama_seq_id seq_id, llama_pos p_min, llama_pos pos_max) const {
+        if (pos_max < p_min || seq_pos[seq_id].empty()) {
+            return false;
+        }
+        const auto & sp = seq_pos[seq_id];
+        const uint64_t n_span = (uint64_t) (pos_max - p_min) + 1;
+        if (p_min == 0) {
+            return seq_pos_dups[seq_id] == 0 &&
+                   sp.size() == n_span &&
+                   sp.begin()->first == 0 &&
+                   sp.rbegin()->first == pos_max;
+        }
+        llama_pos expected = p_min;
+        for (auto it = sp.lower_bound({ p_min, 0 }); it != sp.end() && it->first <= pos_max; ++it) {
+            if (it->first != expected) {
+                return false;
+            }
+            ++expected;
+        }
+        return expected == pos_max + 1;
+    }
+
+    // right-aligned position-ordered cell list per single-seq slice:
+    // col (n_per_seq - n_span) + (pos - p_min) holds the cell for position pos; leading cols are -1
+    LLAMA_ATTRIBUTE_NOINLINE
+    void get_seq_cells_by_pos(const std::vector<llama_kv_rows_slice> & slices, const std::vector<llama_pos> & pos_max, int32_t * data, int64_t n_per_seq) const {
+        assert(slices.size() >= 1 && slices.size() == pos_max.size());
+
+        const int64_t  n_slices = (int64_t) slices.size();
+        const uint32_t n_words  = (used_max_p1() + 63)/64;
+
+        for (int64_t s = 0; s < n_slices; ++s) {
+            assert(slices[s].seq_ids.size() == 1);
+            const llama_seq_id seq_id = slices[s].seq_ids[0];
+            const llama_pos    pm     = slices[s].p_min;
+            const int64_t      n_span = (int64_t) (pos_max[s] - pm) + 1;
+            GGML_ASSERT(n_span > 0 && n_span <= n_per_seq);
+
+            const int64_t pad = n_per_seq - n_span;
+            int32_t * dst = data + s*n_per_seq;
+            std::fill(dst, dst + n_per_seq, -1);
+
+            const auto & bits = seq_bits[seq_id];
+            const uint32_t nw = std::min<uint32_t>(n_words, (uint32_t) bits.size());
+            for (uint32_t w = 0; w < nw; ++w) {
+                for (uint64_t b = bits[w]; b != 0; b &= b - 1) {
+                    const int32_t   i = 64*w + ctz64(b);
+                    const llama_pos p = pos[i];
+                    if (p >= pm && p <= pos_max[s]) {
+                        dst[pad + (p - pm)] = i;
+                    }
+                }
+            }
+        }
+    }
+
     // the minimum position of sequence seq_id currently present in any of the cells
     // return -1 if the sequence is not present
     llama_pos seq_pos_min(llama_seq_id seq_id) const {
@@ -654,6 +712,9 @@ private:
     //
     std::set<std::pair<llama_pos, uint32_t>> seq_pos[LLAMA_MAX_SEQ];
 
+    // count of duplicate-position entries in seq_pos[s] (sum of max(0, count(p) - 1))
+    uint32_t seq_pos_dups[LLAMA_MAX_SEQ] = {};
+
     // bit i of seq_bits[s] is set if cell i carries sequence s (the transpose of `seq`), used to build the cell lists
     // allocated on the first cell of the sequence, so the copies made by cp() never allocate it
     std::vector<uint64_t> seq_bits[LLAMA_MAX_SEQ];
@@ -661,15 +722,28 @@ private:
     // helper functions for updating `seq_pos` and `seq_bits`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, uint32_t i) {
-        const auto n = seq_pos[s].erase({ pos[i], i });
-        assert(n == 1);
-        GGML_UNUSED(n);
+        auto it = seq_pos[s].find({ pos[i], i });
+        assert(it != seq_pos[s].end());
+        const bool prev_same = it != seq_pos[s].begin() && std::prev(it)->first == pos[i];
+        const bool next_same = std::next(it) != seq_pos[s].end() && std::next(it)->first == pos[i];
+        if (prev_same || next_same) {
+            assert(seq_pos_dups[s] > 0);
+            --seq_pos_dups[s];
+        }
+        seq_pos[s].erase(it);
 
         seq_bits[s][i/64] &= ~(1ull << (i%64));
     }
 
     void seq_pos_inc(llama_seq_id s, uint32_t i) {
-        seq_pos[s].insert({ pos[i], i });
+        auto [it, inserted] = seq_pos[s].insert({ pos[i], i });
+        assert(inserted);
+        GGML_UNUSED(inserted);
+        const bool prev_same = it != seq_pos[s].begin() && std::prev(it)->first == pos[i];
+        const bool next_same = std::next(it) != seq_pos[s].end() && std::next(it)->first == pos[i];
+        if (prev_same || next_same) {
+            ++seq_pos_dups[s];
+        }
 
         if (seq_bits[s].empty()) {
             seq_bits[s].assign((pos.size() + 63)/64, 0);

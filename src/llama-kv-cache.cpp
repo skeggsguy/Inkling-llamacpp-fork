@@ -1419,6 +1419,70 @@ uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const 
     return (span.valid() && span.n1 == 0) ? span.c0 + span.n0 : 0;
 }
 
+uint32_t llama_kv_cache::get_kv_banded_rows(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t * n_slices_out) const {
+    if (n_stream != 1 || sinfo.n_stream() != 1 || ubatch.n_tokens == 0 ||
+        ubatch.pos == nullptr || ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr) {
+        return 0;
+    }
+
+    const uint32_t n_slices = get_n_kv_slices(ubatch);
+    if (n_slices == 0 || n_slices != ubatch.n_seqs_unq || ubatch.n_tokens % n_slices != 0) {
+        return 0;
+    }
+
+    const uint32_t n_tps = ubatch.n_tokens / n_slices;
+    const auto & cells   = v_cells[0];
+
+    uint32_t n_max = 0;
+    for (uint32_t s = 0; s < n_slices; ++s) {
+        const uint32_t base = s*n_tps;
+        if (ubatch.n_seq_id[base] != 1 || ubatch.seq_id[base] == nullptr) {
+            return 0;
+        }
+        const llama_seq_id seq_id = ubatch.seq_id[base][0];
+        if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+            return 0;
+        }
+
+        const llama_pos pos_max = cells.seq_pos_max(seq_id);
+        if (pos_max < 0 || (uint64_t) pos_max + 1 < n_tps) {
+            return 0;
+        }
+
+        const llama_pos pos_start = pos_max + 1 - (llama_pos) n_tps;
+        for (uint32_t i = 0; i < n_tps; ++i) {
+            if (ubatch.pos[base + i] != pos_start + (llama_pos) i ||
+                ubatch.n_seq_id[base + i] != 1 || ubatch.seq_id[base + i] == nullptr ||
+                ubatch.seq_id[base + i][0] != seq_id) {
+                return 0;
+            }
+        }
+
+        llama_pos p_min = 0;
+        if (n_swa > 0 && swa_type == LLAMA_SWA_TYPE_STANDARD && pos_start >= (llama_pos) n_swa) {
+            p_min = pos_start - (llama_pos) n_swa + 1;
+        }
+
+        const uint64_t n_span = (uint64_t) (pos_max - p_min) + 1;
+        if (n_span > cells.size() || !cells.has_unique_pos_span(seq_id, p_min, pos_max)) {
+            return 0;
+        }
+
+        n_max = std::max<uint32_t>(n_max, (uint32_t) n_span);
+    }
+
+    const uint32_t n_pad  = 256;
+    const uint32_t n_rows = std::min(std::max(n_pad, GGML_PAD(n_max, n_pad)), get_size());
+    if (n_rows < n_max || n_rows % 64 != 0) {
+        return 0;
+    }
+
+    if (n_slices_out) {
+        *n_slices_out = n_slices;
+    }
+    return n_rows;
+}
+
 uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
     if (ubatch.n_seqs_unq == 1) {
         return 1;
@@ -2083,6 +2147,73 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
         //const int64_t t_end = ggml_time_us();
 
         //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+    }
+}
+
+void llama_kv_cache::set_input_banded_rows(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {
+    if (attn_mask.rows && attn_mask.rows->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(attn_mask.rows->buffer));
+        GGML_ASSERT(n_stream == 1);
+
+        const int64_t  n_rows   = attn_mask.rows->ne[0];
+        const int64_t  n_slices = attn_mask.rows->ne[1];
+        const uint32_t n_tps    = ubatch->n_tokens / (uint32_t) n_slices;
+
+        std::vector<llama_kv_rows_slice> slices(n_slices);
+        std::vector<llama_pos>           pos_max(n_slices);
+
+        for (int64_t s = 0; s < n_slices; ++s) {
+            const uint32_t base      = (uint32_t) s*n_tps;
+            const llama_pos pos_start = ubatch->pos[base];
+            slices[s].seq_ids = { ubatch->seq_id[base][0] };
+            slices[s].p_min   = (n_swa > 0 && swa_type == LLAMA_SWA_TYPE_STANDARD && pos_start >= (llama_pos) n_swa)
+                    ? pos_start - (llama_pos) n_swa + 1 : 0;
+            pos_max[s]        = ubatch->pos[base + n_tps - 1];
+        }
+
+        v_cells[0].get_seq_cells_by_pos(slices, pos_max, (int32_t *) attn_mask.rows->data, n_rows);
+    }
+
+    if (attn_mask.raw && attn_mask.raw->buffer) {
+        llm_attn_mask tmp = attn_mask;
+        // rows are already populated in position order; pass via set_input_attn_mask_impl without overwriting rows
+        const int32_t * rows = attn_mask.rows && attn_mask.rows->buffer ? (const int32_t *) attn_mask.rows->data : nullptr;
+        ggml_tensor * dst = tmp.raw;
+
+        const uint32_t n_tokens = ubatch->n_tokens;
+        const int64_t  n_kv     = dst->ne[0];
+        const int64_t  n_strm   = dst->ne[3];
+
+        GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+        GGML_ASSERT(!rows || (attn_mask.rows->ne[0] == n_kv && attn_mask.rows->ne[1] == n_strm));
+        GGML_ASSERT(n_tokens % n_strm == 0);
+
+        if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+            causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+        }
+        if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_DENSE_ONLY) {
+            causal_attn = swa_type != LLAMA_SWA_TYPE_NONE;
+        }
+
+        const args_set_input_attn_mask args = {
+            /*.hparams          =*/ hparams,
+            /*.ubatch           =*/ ubatch,
+            /*.v_cells          =*/ v_cells,
+            /*.seq_to_stream    =*/ seq_to_stream,
+            /*.n_swa            =*/ n_swa,
+            /*.swa_type         =*/ swa_type,
+            /*.n_kv             =*/ n_kv,
+            /*.n_stream         =*/ n_strm,
+            /*.n_tps            =*/ n_tokens / n_strm,
+            /*.rows             =*/ rows,
+            /*.block_uniform    =*/ tmp.block_uniform,
+        };
+
+        if (dst->type == GGML_TYPE_F16) {
+            set_input_attn_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
+        } else {
+            set_input_attn_mask_impl<float>(args, (float *) dst->data, causal_attn);
+        }
     }
 }
 
@@ -3219,6 +3350,13 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
     return (span.valid() && span.n1 == 0) ? span.c0 + span.n0 : 0;
 }
 
+uint32_t llama_kv_cache_context::get_kv_banded_rows(uint32_t * n_slices_out) const {
+    if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
+        return 0;
+    }
+    return kv->get_kv_banded_rows(sinfos[i_cur], ubatches[i_cur], n_slices_out);
+}
+
 uint32_t llama_kv_cache_context::get_n_kv_rows() const {
     return n_kv_rows;
 }
@@ -3285,6 +3423,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_attn_mask(attn_mask, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_banded_rows(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {
+    kv->set_input_banded_rows(attn_mask, ubatch, causal_attn);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

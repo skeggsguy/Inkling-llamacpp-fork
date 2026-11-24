@@ -5502,19 +5502,28 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
     return result;
 }
 
-struct ggml_tensor * ggml_flash_attn_ext_banded(
+static struct ggml_tensor * ggml_flash_attn_ext_banded_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
         struct ggml_tensor  * v,
         struct ggml_tensor  * mask,
+        struct ggml_tensor  * kv_rows,
         struct ggml_tensor  * rel_logits,
         float                 scale,
         int64_t               rel_extent) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
     GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(q->ne[3] == k->ne[3]);
-    GGML_ASSERT(q->ne[3] == v->ne[3]);
+    if (kv_rows) {
+        GGML_ASSERT(mask && mask->ne[0] == kv_rows->ne[0]);
+        GGML_ASSERT(kv_rows->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_rows));
+        GGML_ASSERT(kv_rows->ne[1] == q->ne[3] && kv_rows->ne[2] == 1 && kv_rows->ne[3] == 1);
+        GGML_ASSERT(k->ne[3] == 1);
+        GGML_ASSERT(v->ne[3] == 1);
+    } else {
+        GGML_ASSERT(q->ne[3] == k->ne[3]);
+        GGML_ASSERT(q->ne[3] == v->ne[3]);
+    }
     GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
     GGML_ASSERT(q->ne[2] % v->ne[2] == 0);
 
@@ -5546,9 +5555,35 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
     result->src[1] = k;
     result->src[2] = v;
     result->src[3] = mask;
+    result->src[5] = kv_rows;
     result->src[6] = rel_logits;
 
     return result;
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_banded(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * rel_logits,
+        float                 scale,
+        int64_t               rel_extent) {
+    return ggml_flash_attn_ext_banded_impl(ctx, q, k, v, mask, NULL, rel_logits, scale, rel_extent);
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_banded_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * kv_rows,
+        struct ggml_tensor  * rel_logits,
+        float                 scale,
+        int64_t               rel_extent) {
+    return ggml_flash_attn_ext_banded_impl(ctx, q, k, v, mask, kv_rows, rel_logits, scale, rel_extent);
 }
 
 struct ggml_tensor * ggml_flash_attn_ext(

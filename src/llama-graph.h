@@ -836,8 +836,9 @@ public:
     ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };
     ggml_tensor * self_kq_mask_dev[2] = { nullptr, nullptr };
 
-    // [base, swa] K/V cell spans of the banded attention, invalid = dense
+    // [base, swa] K/V cell spans of the banded attention, or right-aligned position-ordered kv_rows (unified)
     llama_kv_banded_span banded_span[2] = {};
+    llm_attn_mask        banded_rows[2] = {};
     bool                 banded         = false;
 
     const uint32_t extent;

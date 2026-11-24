@@ -14,6 +14,17 @@ constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EX
 constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
 constant bool    FC_flash_attn_ext_vec_has_sparse [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
 constant bool    FC_flash_attn_ext_vec_has_rows   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 6)]];
+constant bool    FC_flash_attn_ext_vec_has_rel    [[function_constant(FC_FLASH_ATTN_EXT_VEC + 7)]];
+
+// rel type: 0 - F32, 1 - F16
+constant int32_t FC_flash_attn_ext_vec_rel_type   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 24)]];
+
+static inline float flash_attn_ext_vec_rel_load(device const char * rel, int32_t i) {
+    if (FC_flash_attn_ext_vec_rel_type == 1) {
+        return ((device const half *) rel)[i];
+    }
+    return ((device const float *) rel)[i];
+}
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory
@@ -44,6 +55,7 @@ kernel void kernel_flash_attn_ext_vec(
         device const char * pad,
         device       char * dst,
         device const char * idx,
+        device const char * rel,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
@@ -421,7 +433,21 @@ kernel void kernel_flash_attn_ext_vec(
             {
                 FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                     const float m = M[qq];
-                    const float s = ss[qq*C + tiisg];
+                    float s = ss[qq*C + tiisg];
+
+                    // banded: add rel[dist] for 0 <= dist < ne_r0 using unpadded block column ic0*C + tiisg
+                    if (FC_flash_attn_ext_vec_has_rel) {
+                        const int32_t iq1_q = iq1*Q + qq;
+                        const int32_t dmax  = iq1_q + args.q_off - ic0*C;
+
+                        if (iq1_q < args.ne01 && dmax >= 0 && dmax - (C - 1) < args.ne_r0) {
+                            device const char * pr = rel + iq2*args.nb_r1 + iq1_q*args.nb_r2 + iq3*args.nb_r3;
+                            const int32_t d = dmax - tiisg;
+                            if (d >= 0 && d < args.ne_r0) {
+                                s += flash_attn_ext_vec_rel_load(pr, d);
+                            }
+                        }
+                    }
 
                     M[qq] = simd_max(max(M[qq], s));
 
@@ -568,7 +594,9 @@ kernel void kernel_flash_attn_ext_vec(
         if (FC_flash_attn_ext_vec_has_sinks && sgitg == 0 && iwg == 0) {
             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                 const float m = M[qq];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+                // per-query sinks use non-zero strides
+                const int32_t jq = min((int32_t) (iq1*Q + qq), args.ne01 - 1);
+                const float s = tiisg == 0 ? *((device const float *) (sinks + iq2*sizeof(float) + jq*args.nb_s1 + iq3*args.nb_s2)) : -FLT_MAX/2;
 
                 M[qq] = simd_max(max(M[qq], s));
 

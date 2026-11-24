@@ -2278,6 +2278,18 @@ extern "C" {
             float                 scale,
             int64_t               rel_extent);
 
+    // same as ggml_flash_attn_ext_banded, with per-slice K/V row lists (kv_rows: [n_kv, ne3] I32)
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_banded_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * kv_rows,
+            struct ggml_tensor  * rel_logits,
+            float                 scale,
+            int64_t               rel_extent);
+
     // same as ggml_flash_attn_ext, but each q slice attends to its own list of K/V rows
     // q:       [n_embd_k, n_batch, n_head,    ne3]
     // k:       [n_embd_k, n_rows,  n_head_kv, 1  ] shared by all q slices

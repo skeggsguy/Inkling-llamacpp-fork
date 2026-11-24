@@ -3202,8 +3202,8 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
 bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
 
-    // banded attention runs on the half8x8 or the tensor kernel
-    if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED) {
+    // fa_vec_f32 converts Q to F16; keep F32 banded on fa_f32 to preserve F32 precision
+    if (op->op == GGML_OP_FLASH_ATTN_EXT_BANDED && op->src[1]->type == GGML_TYPE_F32) {
         return false;
     }
 
@@ -3295,8 +3295,8 @@ static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool
 static int ggml_metal_op_flash_attn_ext_n_kv_max_sparse(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
 
-    // K/V row lists are handled by the dense kernels, not by the sparse path
-    if (op->src[5] != nullptr) {
+    // K/V row lists and banded attention are not handled by the sparse path
+    if (op->src[5] != nullptr || op->op == GGML_OP_FLASH_ATTN_EXT_BANDED) {
         return 0;
     }
 
@@ -3997,7 +3997,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.n_head_log2   =*/ n_head_log2,
             /*.logit_softcap =*/ logit_softcap,
             /*.ne_r0         =*/ ne_r0,
-            /*.q_off         =*/ ne11 - ne01,
+            /*.q_off         =*/ (int32_t) ne11_attn - ne01,
             /*.nb_r1         =*/ nb_r1,
             /*.nb_r2         =*/ nb_r2,
             /*.nb_r3         =*/ nb_r3,
@@ -4134,7 +4134,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.n_head_log2   =*/ n_head_log2,
             /*.logit_softcap =*/ logit_softcap,
             /*.ne_r0         =*/ ne_r0,
-            /*.q_off         =*/ ne11 - ne01,
+            /*.q_off         =*/ (int32_t) ne11_attn - ne01,
             /*.nb_r1         =*/ nb_r1,
             /*.nb_r2         =*/ nb_r2,
             /*.nb_r3         =*/ nb_r3,
@@ -4319,9 +4319,16 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.n_head_log2   =*/ n_head_log2,
             /*.logit_softcap =*/ logit_softcap,
             /*.n_kv_max_padded =*/ n_kv_max_padded,
+            /*.ne_r0         =*/ ne_r0,
+            /*.q_off         =*/ (int32_t) ne11_attn - ne01,
+            /*.nb_r1         =*/ nb_r1,
+            /*.nb_r2         =*/ nb_r2,
+            /*.nb_r3         =*/ nb_r3,
+            /*.nb_s1         =*/ nb_s1,
+            /*.nb_s2         =*/ nb_s2,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, has_rel, rel_type, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -4333,6 +4340,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
         ggml_metal_encoder_set_buffer  (enc, use_sparse ? bid_idx : (has_rows ? ggml_metal_get_buffer_id(kv_rows) : bid_src0), 8);
+        ggml_metal_encoder_set_buffer  (enc, bid_rel,  9);
 
         const size_t smem = fa_vec_smem(nsg, nqptg);
 

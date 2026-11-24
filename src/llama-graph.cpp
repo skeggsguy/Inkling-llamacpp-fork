@@ -1469,6 +1469,10 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_base()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
     }
 
+    if (banded_rows[0].rows && banded_rows[0].rows->buffer) {
+        attn_ctx->get_base()->set_input_banded_rows(banded_rows[0], ubatch, cparams.causal_attn);
+    }
+
     if (self_rel_pos->buffer) {
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
     }
@@ -1481,6 +1485,10 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
 
     if (inp_attn->self_attn_mask_swa.raw && inp_attn->self_attn_mask_swa.raw->buffer) {
         attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
+    }
+
+    if (banded_rows[1].rows && banded_rows[1].rows->buffer) {
+        attn_ctx->get_swa()->set_input_banded_rows(banded_rows[1], ubatch, cparams.causal_attn);
     }
 
     if (self_rel_pos_swa->buffer) {
@@ -1516,24 +1524,46 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
         res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
     }
 
-    res &= can_reuse_kq_mask(inp_attn->self_attn_mask.raw, attn_ctx->get_base(), params.ubatch, params.cparams);
+    if (inp_attn->self_attn_mask.raw && inp_attn->self_attn_mask.raw->buffer) {
+        res &= can_reuse_kq_mask(inp_attn->self_attn_mask.raw, attn_ctx->get_base(), params.ubatch, params.cparams);
+    }
 
-    res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
-    res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
+    if (self_rel_pos->buffer || !banded) {
+        res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
+        res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
+    }
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
         res &= inp_attn->self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
     }
 
-    res &= can_reuse_kq_mask(inp_attn->self_attn_mask_swa.raw, attn_ctx->get_swa(), params.ubatch, params.cparams);
+    if (inp_attn->self_attn_mask_swa.raw && inp_attn->self_attn_mask_swa.raw->buffer) {
+        res &= can_reuse_kq_mask(inp_attn->self_attn_mask_swa.raw, attn_ctx->get_swa(), params.ubatch, params.cparams);
+    }
 
-    res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
-    res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+    if (self_rel_pos_swa->buffer || !banded) {
+        res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+        res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+    }
 
     if (banded) {
-        res &= attn_ctx->get_base()->get_kv_banded_span() == banded_span[0];
-        res &= attn_ctx->get_swa()->get_kv_banded_span()  == banded_span[1];
+        for (int i = 0; i < 2; ++i) {
+            const auto * cache = i ? attn_ctx->get_swa() : attn_ctx->get_base();
+            if (banded_rows[i].rows != nullptr) {
+                uint32_t cur_slices = 0;
+                const uint32_t cur_rows = cache->get_kv_banded_rows(&cur_slices);
+                res &= banded_rows[i].n_kv == cache->get_n_kv();
+                res &= cur_rows == (uint32_t) banded_rows[i].rows->ne[0];
+                res &= cur_slices > 0 && cur_slices == (uint32_t) banded_rows[i].rows->ne[1];
+                res &= cur_slices > 0 && banded_rows[i].raw->ne[1] == params.ubatch.n_tokens / (int64_t) cur_slices;
+            } else if (banded_span[i].valid()) {
+                res &= cache->get_kv_banded_span() == banded_span[i];
+            } else {
+                res &= !cache->get_kv_banded_span().valid();
+                res &= (!params.cparams.kv_unified || cache->get_kv_banded_rows() == 0);
+            }
+        }
     }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
