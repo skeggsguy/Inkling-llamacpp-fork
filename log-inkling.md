@@ -20,6 +20,8 @@ Separate clean PR 2 worktree: `/Users/tomskeggs/dev/llama.cpp-inkling-pr2` (bran
 | `721e555b8` | Server scheduling | Optional PR / local tuning | Dynamic decode-priority chunked prefill (2 pure decode ticks per `128`-token prefill chunk while any slot writes; full `-b/-ub` when solo) |
 | `117ef8c36` | DSpark (DSpark uplift #3) | Follow-up PR (`unslothai/llama.cpp`) | Prune Inkling2 greedy Markov head and LM-head projection to only `1..n_draft` output slots (+ partial-output graph reuse guard) |
 | `d9a9c5140` | DSpark (DSpark uplift #4) | Follow-up PR (`unslothai/llama.cpp`) | Enable `dev_features`, backend greedy sampling (with zero raw-logit copy fix), fused `mix()`, hoisted `dspark_joint_proj`, and probabilistic `sample_rnn` cleanup |
+| `14cd30131` | Metal banded `fa_vec` + `kv_rows` | Follow-up PR (`unslothai/llama.cpp`) | Add `FLASH_ATTN_EXT_BANDED` + `kv_rows` to Metal `fa_vec`, right-aligned position-ordered `kv_rows` for fragmented `-kvu` and concurrent multi-slot decode |
+| `d58ad28ca` | Inkling chat parser | Standalone PR (`ggml-org` / `unslothai`) | Restrict Inkling lazy grammar triggers to declared tool names through `<|content_invoke_tool_json|>` to prevent empty-grammar-stack crashes |
 
 ---
 
@@ -124,6 +126,26 @@ Separate clean PR 2 worktree: `/Users/tomskeggs/dev/llama.cpp-inkling-pr2` (bran
   - Bit-for-bit identical greedy server outputs vs `#1+#2+#8`: 3.5K prompt eval `6006.2 -> 5636.2 ms` (`589.6 -> 628.3 t/s`, `-370 ms`), single-seq draft `8.13 -> 7.36-7.75 ms/call`, 4x concurrent `49.04 t/s` aggregate with draft `10.34 ms/batch` (`2.97 ms/seq`).
   - Live 115K-context session: draft `14.08 ms/call` (~9.4% of verify step time), `mean acc len = 2.61`.
 
+### 11. PR 11 Candidate: Metal Banded `fa_vec` + Right-Aligned `kv_rows` Decode (`14cd30131`)
+- **Files:** `ggml/include/ggml.h`, `ggml/src/ggml.c`, `ggml/src/ggml-cpu/ops.cpp`, `ggml/src/ggml-metal/{ggml-metal-device.*,ggml-metal-impl.h,ggml-metal-ops.cpp,kernels/fa_vec_common.metal}`, `src/{llama-kv-cells.h,llama-kv-cache.*,llama-graph.*,models/inkling2.cpp}`, `tests/test-backend-ops.cpp`.
+- **Problem:** High-context decode (`n_tokens <= 32`) skipped `FLASH_ATTN_EXT_BANDED` and fell back to dense unfused `kq_b` attention (~3+ GB F32 bias/score traffic per step at 120K), dropping live `-kvu` decode from `~36 t/s` at 3.5K to `15.6-18.1 t/s` at 120K-131K. Contiguous-span banded FA also could not handle fragmented `-kvu` caches or concurrent multi-slot decode (`n_slices > 1`).
+- **Fix:**
+  - Added `ggml_flash_attn_ext_banded_rows(...)` (`src[5] = kv_rows`) and aligned CPU `rel_dist` with `kv_rows->ne[0]`.
+  - Added relative bias (`rel` buffer 9, F32/F16) and per-query/per-slice sink indexing to Metal `fa_vec_common.metal`, enabled `use_vec` for quantized/F16 `FLASH_ATTN_EXT_BANDED` (keeping F32 on `fa_f32` for precision), and enabled `kv_rows` validation + `rows_gather` prefill fallback. Zero extra scratch (`extra_rows == 0`, `extra_kv_f16 == 0`) under `use_vec`.
+  - Added O(1) duplicate-position tracking (`seq_pos_dups`), `has_unique_pos_span`, and `get_seq_cells_by_pos` to right-align each slice's active cells `[p_min .. pos_max]` to the end of 256-padded `n_rows`. This keeps `q_off = n_rows - n_q` exact across concurrent slots of different context lengths while leading `-1` pad blocks are skipped via `-inf` mask (`!any_finite`), with 256-step graph reuse.
+  - Enabled banded decode past `n_kv_banded_decode_min = 8192` in `inkling2.cpp` (preferring right-aligned `kv_rows` for unified decode and fragmented prefill fallback).
+- **Verified numbers (M5 Pro, `-np 5 -c 600000 -kvu --kv-unified-per-slot 200000 -ctk q8_0 -ctv q8_0`, DSpark):**
+  - `test-backend-ops test -o FLASH_ATTN_EXT_BANDED -b MTL0`: **110/110 passed** (both `tensor` and `GGML_METAL_TENSOR_DISABLE=1`), including 12 new `banded_rows` cases (1/2/4 slices, mixed lengths, interleaved cells, `f16`/`q8_0`/`q4_0`). Plain `FLASH_ATTN_EXT`: all passed.
+  - Compute reserve unchanged (`4803.92 MiB`); short-context `bench_req1` / `bench_long`: `parity=EXACT` (`35.34 / 36.79 t/s`).
+  - Solo fragmented `-kvu`: **42.7K** `38.23 t/s` (vs `21.3-31.4` / `23.9` @ 48K before, ~+60%); **85.5K** `31.24 t/s` (vs `19.1` @ 84K, +64%); **172K** `24.66 t/s` (vs `15.6-18.1` @ 120K-131K, +36-58% even at 40K longer ctx, `0` decode reallocs).
+  - Concurrent fragmented `-kvu`: **2x 42.7K** `39.25 t/s` aggregate (`19.75 + 19.50 t/s`/slot, `0` decode reallocs); **2x mixed 172K + 42.7K** `27.38 t/s` aggregate (`13.31 + 14.07 t/s`/slot).
+
+### 12. PR 12 Candidate: Inkling Lazy Grammar Trigger Fix (`d58ad28ca`)
+- **Files:** `common/parsers/inkling.cpp`, `tests/test-chat.cpp`.
+- **Problem:** Inkling's lazy tool-call grammar triggered on `<\|message_model\|>([^<])` (and `[^<]+` for Inkling 1). Because the grammar does not constrain logits while `awaiting_trigger`, any undeclared tool name (e.g. `"sheets"`), whitespace, or prose missing `<|content_text|>` after `<|message_model|>` woke the grammar and immediately crashed the request with `Unexpected empty grammar stack after accepting piece`.
+- **Fix:** Match only escaped declared tool names followed by `<|content_invoke_tool_json|>` (`<\|message_model\|>((?:tool1|tool2|...)<\|content_invoke_tool_json\|>)` plus `PATTERN_FULL` for Inkling 1), and added a regression test in `tests/test-chat.cpp`.
+- **Verified:** `./build/bin/test-chat` (`[chat] All tests passed!`).
+
 ---
 
 ## Current Live Server Configuration
@@ -134,12 +156,12 @@ Separate clean PR 2 worktree: `/Users/tomskeggs/dev/llama.cpp-inkling-pr2` (bran
   -m /Volumes/skeggsdrive/models/unsloth/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q8_K_XL.gguf \
   --alias inkling -ngl 99 -fa on --jinja \
   --host 127.0.0.1 --port 8080 --log-timestamps \
-  -np 3 -c 600000 --no-kv-unified \
+  -np 5 -c 600000 -kvu --kv-unified-per-slot 200000 \
   -ctk q8_0 -ctv q8_0 -ctkd q8_0 -ctvd q8_0 \
-  -b 2048 -ub 2048 --spec-draft-n-ubatch 64 -ctxcp 5 \
+  -b 2048 -ub 1024 --spec-draft-n-ubatch 64 -ctxcp 5 \
   --mmproj /Volumes/skeggsdrive/models/unsloth/Inkling-2-Mini-GGUF/mmproj-F16.gguf \
   -md /Volumes/skeggsdrive/models/unsloth/Inkling-2-Mini-GGUF/dspark-Inkling-2-Mini-Q8_0.gguf \
   --spec-type draft-dspark --spec-draft-p-min 0
 ```
 
-- Footprint on Apple M5 Pro (64 GiB unified, `iogpu.wired_limit_mb = 59392`): `39.9 / 59.4 GiB` GPU used (**`19.1 GiB` headroom**), 3 isolated `200K` slots + 8 GiB RAM prompt cache (`--cache-ram`) for extra idle conversations.
+- Footprint on Apple M5 Pro (64 GiB unified, `iogpu.wired_limit_mb = 59392`): `MTL0` KV `9.96 + 0.51 GiB` (target) + `1.25 + 0.02 GiB` (draft), `MTL0` compute `4.80 GiB` (target) + `0.12 GiB` (draft), 5 unified slots capped at `200K` each (`-kvu --kv-unified-per-slot 200000`) + 8 GiB RAM prompt cache.
